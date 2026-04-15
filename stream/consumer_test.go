@@ -160,6 +160,46 @@ func TestConsumerAutoAckClearsPending(t *testing.T) {
 	assert.EqualValues(t, 0, pending.Count)
 }
 
+func TestConsumerReclaimPending(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	// Set up group so the consumer can read as a member.
+	require.NoError(t, c.XAdd(context.Background(), &goredis.XAddArgs{
+		Stream: "events", Values: map[string]any{"data": "seed"},
+	}).Err())
+	require.NoError(t, c.XGroupCreate(context.Background(), "events", "g", "0").Err())
+
+	// Consumer A reads (no ack) so the entry is pending under A.
+	entriesA, err := c.XReadGroup(context.Background(), &goredis.XReadGroupArgs{
+		Group: "g", Consumer: "A",
+		Streams: []string{"events", ">"},
+		Count:   1,
+	}).Result()
+	require.NoError(t, err)
+	require.Len(t, entriesA, 1)
+	require.Len(t, entriesA[0].Messages, 1)
+
+	// Consumer B starts with reclaim_pending + zero min_idle → it should
+	// steal the pending entry and redeliver it.
+	recv := &recorder{}
+	cons := stream.NewConsumer("B", c).
+		WithStream("events").
+		WithGroup("g").
+		WithConsumerName("B").
+		WithBlockTimeout(100 * time.Millisecond).
+		WithReclaimPending(true).
+		WithReclaimMinIdle(0).
+		WithTarget(recv).
+		Build()
+	require.NoError(t, cons.Start(context.Background()))
+	defer cons.Stop()
+
+	evs := recv.wait(t, 1)
+	require.Len(t, evs, 1)
+}
+
 func TestConsumerAutoAckFalseLeavesPending(t *testing.T) {
 	mr := miniredis.RunT(t)
 	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})

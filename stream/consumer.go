@@ -54,6 +54,11 @@ type RedisStreamConsumer struct {
 	fieldsMode       FieldsMode
 	logger           *zap.Logger
 
+	reclaimPending   bool
+	reclaimMinIdle   time.Duration
+	deadLetterStream string
+	deadLetterAfter  int64
+
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	running sync.WaitGroup
@@ -72,6 +77,16 @@ func (c *RedisStreamConsumer) Start(ctx context.Context) error {
 		return fmt.Errorf("redis_stream consumer %q: %w", c.name, err)
 	}
 
+	if c.reclaimPending {
+		if err := c.reclaimOwn(ctx); err != nil {
+			c.logger.Warn("redis_stream consumer: reclaim pending",
+				zap.String("consumer", c.name),
+				zap.Error(err))
+			// Don't fail Start on reclaim errors — the consumer can still
+			// make forward progress on new entries.
+		}
+	}
+
 	runCtx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 	c.mu.Unlock()
@@ -80,6 +95,23 @@ func (c *RedisStreamConsumer) Start(ctx context.Context) error {
 	go c.runLoop(runCtx)
 	return nil
 }
+
+// Ack issues XACK for the given entry ID on this consumer's stream and
+// group. Used by the redis_ack() HCL function when auto_ack is false.
+func (c *RedisStreamConsumer) Ack(ctx context.Context, id string) error {
+	if err := c.client.XAck(ctx, c.streamName, c.group, id).Err(); err != nil {
+		return fmt.Errorf("redis_stream consumer %q: xack %s: %w", c.name, id, err)
+	}
+	return nil
+}
+
+// Stream returns the stream name this consumer reads from. Used by
+// callers that need to pair the consumer with stream-level operations
+// (e.g. XPENDING queries in integration tests).
+func (c *RedisStreamConsumer) Stream() string { return c.streamName }
+
+// Group returns the consumer group name.
+func (c *RedisStreamConsumer) Group() string { return c.group }
 
 func (c *RedisStreamConsumer) Stop() error {
 	c.mu.Lock()
@@ -117,6 +149,66 @@ func (c *RedisStreamConsumer) ensureGroup(ctx context.Context) error {
 	err := c.client.XGroupCreateMkStream(ctx, c.streamName, c.group, startID).Err()
 	if err != nil && !isBusyGroupErr(err) {
 		return fmt.Errorf("xgroup create %q/%q: %w", c.streamName, c.group, err)
+	}
+	return nil
+}
+
+// reclaimOwn walks this consumer/group's pending list at startup and
+// re-claims entries idle for at least reclaimMinIdle via XCLAIM. The
+// claimed entries then appear on the next XREADGROUP poll and are
+// delivered normally.
+func (c *RedisStreamConsumer) reclaimOwn(ctx context.Context) error {
+	pending, err := c.client.XPendingExt(ctx, &goredis.XPendingExtArgs{
+		Stream: c.streamName,
+		Group:  c.group,
+		Start:  "-",
+		End:    "+",
+		Count:  1000,
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("xpending: %w", err)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(pending))
+	for _, p := range pending {
+		if p.Idle >= c.reclaimMinIdle {
+			ids = append(ids, p.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	claimed, err := c.client.XClaim(ctx, &goredis.XClaimArgs{
+		Stream:   c.streamName,
+		Group:    c.group,
+		Consumer: c.consumerName,
+		MinIdle:  c.reclaimMinIdle,
+		Messages: ids,
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("xclaim: %w", err)
+	}
+	// Claimed entries are now in our PEL but XREADGROUP > won't redeliver
+	// them. Run them through the delivery path directly so subscribers see
+	// them on Start without waiting for a new XADD.
+	for _, entry := range claimed {
+		if err := c.deliver(ctx, c.streamName, entry); err != nil {
+			c.logger.Warn("redis_stream consumer: reclaim deliver",
+				zap.String("consumer", c.name),
+				zap.String("id", entry.ID),
+				zap.Error(err))
+			continue
+		}
+		if c.autoAck {
+			if err := c.client.XAck(ctx, c.streamName, c.group, entry.ID).Err(); err != nil {
+				c.logger.Warn("redis_stream consumer: reclaim xack",
+					zap.String("consumer", c.name),
+					zap.String("id", entry.ID),
+					zap.Error(err))
+			}
+		}
 	}
 	return nil
 }
@@ -173,6 +265,19 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 						zap.String("stream", s.Stream),
 						zap.String("id", entry.ID),
 						zap.Error(err))
+					// Delivery failed: see whether we've exhausted the
+					// configured retry budget and should DLQ instead of
+					// leaving the entry pending for another attempt.
+					if c.deadLetterStream != "" && c.deadLetterAfter > 0 {
+						if moved, dlErr := c.maybeDeadLetter(ctx, s.Stream, entry); dlErr != nil {
+							c.logger.Warn("redis_stream consumer: dead-letter",
+								zap.String("consumer", c.name),
+								zap.String("id", entry.ID),
+								zap.Error(dlErr))
+						} else if moved {
+							continue
+						}
+					}
 					// auto_ack only on successful delivery.
 					continue
 				}
@@ -188,6 +293,47 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// maybeDeadLetter checks this entry's delivery count via XPENDING and, if
+// it has exceeded deadLetterAfter, re-adds it to the dead-letter stream
+// and XACKs the original. Returns true when the entry was moved.
+func (c *RedisStreamConsumer) maybeDeadLetter(ctx context.Context, streamName string, entry goredis.XMessage) (bool, error) {
+	pending, err := c.client.XPendingExt(ctx, &goredis.XPendingExtArgs{
+		Stream: streamName,
+		Group:  c.group,
+		Start:  entry.ID,
+		End:    entry.ID,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		return false, fmt.Errorf("xpending: %w", err)
+	}
+	if len(pending) == 0 {
+		return false, nil
+	}
+	// XREADGROUP already incremented the delivery count before we got
+	// here, so RetryCount reflects this attempt inclusive. Move once the
+	// consumer has tried at least deadLetterAfter times.
+	if pending[0].RetryCount < c.deadLetterAfter {
+		return false, nil
+	}
+	values := make(map[string]interface{}, len(entry.Values)+2)
+	for k, v := range entry.Values {
+		values[k] = v
+	}
+	values["_dlq_original_stream"] = streamName
+	values["_dlq_original_id"] = entry.ID
+	if _, err := c.client.XAdd(ctx, &goredis.XAddArgs{
+		Stream: c.deadLetterStream,
+		Values: values,
+	}).Result(); err != nil {
+		return false, fmt.Errorf("xadd dlq: %w", err)
+	}
+	if err := c.client.XAck(ctx, streamName, c.group, entry.ID).Err(); err != nil {
+		return false, fmt.Errorf("xack: %w", err)
+	}
+	return true, nil
 }
 
 func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, entry goredis.XMessage) error {

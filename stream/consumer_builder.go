@@ -25,6 +25,10 @@ type ConsumerBuilder struct {
 	topicField       string
 	contentTypeField string
 	fieldsMode       FieldsMode
+	reclaimPending   bool
+	reclaimMinIdle   time.Duration
+	deadLetterStream string
+	deadLetterAfter  int64
 	logger           *zap.Logger
 }
 
@@ -43,8 +47,30 @@ func NewConsumer(name string, client goredis.UniversalClient) *ConsumerBuilder {
 		topicField:       "topic",
 		contentTypeField: "datacontenttype",
 		fieldsMode:       FieldsFlat,
+		reclaimPending:   true,
+		reclaimMinIdle:   5 * time.Minute,
 		logger:           zap.NewNop(),
 	}
+}
+
+func (b *ConsumerBuilder) WithReclaimPending(v bool) *ConsumerBuilder {
+	b.reclaimPending = v
+	return b
+}
+
+func (b *ConsumerBuilder) WithReclaimMinIdle(d time.Duration) *ConsumerBuilder {
+	b.reclaimMinIdle = d
+	return b
+}
+
+func (b *ConsumerBuilder) WithDeadLetterStream(s string) *ConsumerBuilder {
+	b.deadLetterStream = s
+	return b
+}
+
+func (b *ConsumerBuilder) WithDeadLetterAfter(n int64) *ConsumerBuilder {
+	b.deadLetterAfter = n
+	return b
 }
 
 func (b *ConsumerBuilder) WithStream(s string) *ConsumerBuilder {
@@ -138,6 +164,10 @@ func (b *ConsumerBuilder) Build() *RedisStreamConsumer {
 		topicField:       b.topicField,
 		contentTypeField: b.contentTypeField,
 		fieldsMode:       b.fieldsMode,
+		reclaimPending:   b.reclaimPending,
+		reclaimMinIdle:   b.reclaimMinIdle,
+		deadLetterStream: b.deadLetterStream,
+		deadLetterAfter:  b.deadLetterAfter,
 		logger:           b.logger,
 	}
 }
