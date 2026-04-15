@@ -55,6 +55,7 @@ type RedisPubSubPublisher struct {
 	xformFunc    ChannelFunc
 	defaultXform DefaultChannelTransform
 	logger       *zap.Logger
+	metrics      *pubsubMetrics
 }
 
 // OnEvent resolves the target Redis channel, serializes the payload, and
@@ -74,8 +75,10 @@ func (p *RedisPubSubPublisher) OnEvent(ctx context.Context, topic string, msg an
 	}
 
 	if err := p.client.Publish(ctx, channel, payload).Err(); err != nil {
+		p.metrics.RecordError(ctx, "publish", "publish")
 		return fmt.Errorf("redis_pubsub publisher %q: publish to %q: %w", p.name, channel, err)
 	}
+	p.metrics.RecordSent(ctx, channel)
 	return nil
 }
 

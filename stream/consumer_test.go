@@ -12,6 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/tsarna/vinculum-redis/stream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type recorder struct {
@@ -158,6 +161,35 @@ func TestConsumerAutoAckClearsPending(t *testing.T) {
 	pending, err := c.XPending(context.Background(), "events", "g").Result()
 	require.NoError(t, err)
 	assert.EqualValues(t, 0, pending.Count)
+}
+
+func TestProducerInjectsTraceContext(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	// Install the W3C propagator so Inject writes traceparent.
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	defer otel.SetTextMapPropagator(prevProp)
+
+	// Start a span so there is a valid context to inject.
+	tp := sdktrace.NewTracerProvider()
+	defer tp.Shutdown(context.Background())
+	ctx, span := tp.Tracer("test").Start(context.Background(), "outer")
+	defer span.End()
+
+	p := stream.NewProducer("out", c).WithStreamFunc(func(string, any, map[string]string) (string, error) {
+		return "events", nil
+	}).Build()
+	require.NoError(t, p.OnEvent(ctx, "x", "hi", nil))
+
+	entries, err := c.XRange(context.Background(), "events", "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	tpHeader, ok := entries[0].Values["traceparent"].(string)
+	require.True(t, ok, "expected traceparent field in entry values")
+	assert.Contains(t, tpHeader, span.SpanContext().TraceID().String())
 }
 
 func TestConsumerReclaimPending(t *testing.T) {

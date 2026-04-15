@@ -5,12 +5,15 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
 // ConsumerBuilder constructs a RedisStreamConsumer.
 type ConsumerBuilder struct {
 	name             string
+	clientName       string
 	client           goredis.UniversalClient
 	streamName       string
 	group            string
@@ -30,6 +33,8 @@ type ConsumerBuilder struct {
 	deadLetterStream string
 	deadLetterAfter  int64
 	logger           *zap.Logger
+	meterProvider    metric.MeterProvider
+	tracerProvider   trace.TracerProvider
 }
 
 // NewConsumer returns a builder with the spec defaults: batch_size=10,
@@ -147,6 +152,22 @@ func (b *ConsumerBuilder) WithLogger(l *zap.Logger) *ConsumerBuilder {
 	return b
 }
 
+func (b *ConsumerBuilder) WithMeterProvider(mp metric.MeterProvider) *ConsumerBuilder {
+	b.meterProvider = mp
+	return b
+}
+
+func (b *ConsumerBuilder) WithTracerProvider(tp trace.TracerProvider) *ConsumerBuilder {
+	b.tracerProvider = tp
+	return b
+}
+
+// WithClientName sets the vinculum client block name used as a metric label.
+func (b *ConsumerBuilder) WithClientName(name string) *ConsumerBuilder {
+	b.clientName = name
+	return b
+}
+
 func (b *ConsumerBuilder) Build() *RedisStreamConsumer {
 	return &RedisStreamConsumer{
 		name:             b.name,
@@ -169,5 +190,7 @@ func (b *ConsumerBuilder) Build() *RedisStreamConsumer {
 		deadLetterStream: b.deadLetterStream,
 		deadLetterAfter:  b.deadLetterAfter,
 		logger:           b.logger,
+		metrics:          newStreamMetrics(b.clientName, b.meterProvider),
+		tracerProvider:   b.tracerProvider,
 	}
 }

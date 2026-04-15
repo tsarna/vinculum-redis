@@ -2,12 +2,15 @@ package stream
 
 import (
 	goredis "github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
 // ProducerBuilder constructs a RedisStreamProducer.
 type ProducerBuilder struct {
 	name              string
+	clientName        string
 	client            goredis.UniversalClient
 	streamFunc        StreamFunc
 	defaultXform      DefaultStreamTransform
@@ -18,6 +21,8 @@ type ProducerBuilder struct {
 	contentTypeField  string
 	fieldsMode        FieldsMode
 	logger            *zap.Logger
+	meterProvider     metric.MeterProvider
+	tracerProvider    trace.TracerProvider
 }
 
 // NewProducer returns a builder with sensible defaults: error on
@@ -92,6 +97,22 @@ func (b *ProducerBuilder) WithLogger(l *zap.Logger) *ProducerBuilder {
 	return b
 }
 
+func (b *ProducerBuilder) WithMeterProvider(mp metric.MeterProvider) *ProducerBuilder {
+	b.meterProvider = mp
+	return b
+}
+
+func (b *ProducerBuilder) WithTracerProvider(tp trace.TracerProvider) *ProducerBuilder {
+	b.tracerProvider = tp
+	return b
+}
+
+// WithClientName sets the vinculum client block name used as a metric label.
+func (b *ProducerBuilder) WithClientName(name string) *ProducerBuilder {
+	b.clientName = name
+	return b
+}
+
 func (b *ProducerBuilder) Build() *RedisStreamProducer {
 	return &RedisStreamProducer{
 		name:              b.name,
@@ -105,5 +126,7 @@ func (b *ProducerBuilder) Build() *RedisStreamProducer {
 		contentTypeField:  b.contentTypeField,
 		fieldsMode:        b.fieldsMode,
 		logger:            b.logger,
+		metrics:           newStreamMetrics(b.clientName, b.meterProvider),
+		tracerProvider:    b.tracerProvider,
 	}
 }

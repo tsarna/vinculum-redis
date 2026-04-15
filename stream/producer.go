@@ -5,11 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/tsarna/go2cty2go"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/zclconf/go-cty/cty"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 )
 
@@ -63,6 +69,16 @@ type RedisStreamProducer struct {
 	contentTypeField  string
 	fieldsMode        FieldsMode
 	logger            *zap.Logger
+	metrics           *streamMetrics
+	tracerProvider    trace.TracerProvider
+}
+
+func (p *RedisStreamProducer) tracer() trace.Tracer {
+	tp := p.tracerProvider
+	if tp == nil {
+		tp = noop.NewTracerProvider()
+	}
+	return tp.Tracer("github.com/tsarna/vinculum-redis/stream")
 }
 
 // reservedFields are the entry field names Vinculum writes itself. User
@@ -86,8 +102,9 @@ func IsReservedField(name string) bool {
 
 // OnEvent serializes the event and issues XADD.
 func (p *RedisStreamProducer) OnEvent(ctx context.Context, topic string, msg any, fields map[string]string) error {
-	stream, ok, err := p.resolveStream(topic, msg, fields)
+	streamName, ok, err := p.resolveStream(topic, msg, fields)
 	if err != nil {
+		p.metrics.RecordError(ctx, "publish", "resolve_stream")
 		return fmt.Errorf("redis_stream producer %q: %w", p.name, err)
 	}
 	if !ok {
@@ -96,11 +113,31 @@ func (p *RedisStreamProducer) OnEvent(ctx context.Context, topic string, msg any
 
 	values, err := p.buildValues(topic, msg, fields)
 	if err != nil {
+		p.metrics.RecordError(ctx, "publish", "build_entry")
 		return fmt.Errorf("redis_stream producer %q: build entry: %w", p.name, err)
 	}
 
+	// Inject W3C trace context (traceparent/tracestate) as entry fields.
+	// These are part of the reserved-field set so they always win over
+	// user-supplied fields.
+	carrier := mapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		values[k] = v
+	}
+
+	ctx, span := p.tracer().Start(ctx, "send "+streamName,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "redis"),
+			attribute.String("messaging.destination.name", streamName),
+			attribute.String("messaging.operation.name", "publish"),
+		),
+	)
+	defer span.End()
+
 	args := &goredis.XAddArgs{
-		Stream: stream,
+		Stream: streamName,
 		Values: values,
 	}
 	if p.maxLen > 0 {
@@ -112,9 +149,15 @@ func (p *RedisStreamProducer) OnEvent(ctx context.Context, topic string, msg any
 		}
 	}
 
+	start := time.Now()
 	if _, err := p.client.XAdd(ctx, args).Result(); err != nil {
-		return fmt.Errorf("redis_stream producer %q: XADD %q: %w", p.name, stream, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		p.metrics.RecordError(ctx, "publish", "xadd")
+		return fmt.Errorf("redis_stream producer %q: XADD %q: %w", p.name, streamName, err)
 	}
+	_ = start
+	p.metrics.RecordSent(ctx, streamName)
 	return nil
 }
 

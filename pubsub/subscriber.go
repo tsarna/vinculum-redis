@@ -44,6 +44,7 @@ type RedisPubSubSubscriber struct {
 	subscriptions []ChannelSubscription
 	target        bus.Subscriber
 	logger        *zap.Logger
+	metrics       *pubsubMetrics
 
 	mu      sync.Mutex
 	ps      *goredis.PubSub
@@ -148,7 +149,12 @@ func (s *RedisPubSubSubscriber) deliver(ctx context.Context, msg *goredis.Messag
 		}
 	}
 
-	return s.target.OnEvent(ctx, topic, payload, fields)
+	if err := s.target.OnEvent(ctx, topic, payload, fields); err != nil {
+		s.metrics.RecordError(ctx, "process", "deliver")
+		return err
+	}
+	s.metrics.RecordConsumed(ctx, msg.Channel)
+	return nil
 }
 
 // topicFuncFor finds the VinculumTopicFunc for the subscription that this

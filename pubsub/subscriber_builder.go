@@ -3,16 +3,19 @@ package pubsub
 import (
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 )
 
 // SubscriberBuilder constructs a RedisPubSubSubscriber.
 type SubscriberBuilder struct {
 	name          string
+	clientName    string
 	client        goredis.UniversalClient
 	subscriptions []ChannelSubscription
 	target        bus.Subscriber
 	logger        *zap.Logger
+	meterProvider metric.MeterProvider
 }
 
 func NewSubscriber(name string, client goredis.UniversalClient) *SubscriberBuilder {
@@ -40,6 +43,17 @@ func (b *SubscriberBuilder) WithLogger(l *zap.Logger) *SubscriberBuilder {
 	return b
 }
 
+func (b *SubscriberBuilder) WithMeterProvider(mp metric.MeterProvider) *SubscriberBuilder {
+	b.meterProvider = mp
+	return b
+}
+
+// WithClientName sets the vinculum client block name used as a metric label.
+func (b *SubscriberBuilder) WithClientName(name string) *SubscriberBuilder {
+	b.clientName = name
+	return b
+}
+
 func (b *SubscriberBuilder) Build() *RedisPubSubSubscriber {
 	return &RedisPubSubSubscriber{
 		name:          b.name,
@@ -47,5 +61,6 @@ func (b *SubscriberBuilder) Build() *RedisPubSubSubscriber {
 		subscriptions: b.subscriptions,
 		target:        b.target,
 		logger:        b.logger,
+		metrics:       newPubsubMetrics(b.clientName, b.meterProvider),
 	}
 }

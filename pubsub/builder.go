@@ -2,17 +2,20 @@ package pubsub
 
 import (
 	goredis "github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 )
 
 // PublisherBuilder constructs a RedisPubSubPublisher.
 type PublisherBuilder struct {
-	name         string
-	client       goredis.UniversalClient
-	mappings     []ChannelMapping
-	xformFunc    ChannelFunc
-	defaultXform DefaultChannelTransform
-	logger       *zap.Logger
+	name          string
+	clientName    string
+	client        goredis.UniversalClient
+	mappings      []ChannelMapping
+	xformFunc     ChannelFunc
+	defaultXform  DefaultChannelTransform
+	logger        *zap.Logger
+	meterProvider metric.MeterProvider
 }
 
 // NewPublisher returns a PublisherBuilder with default_channel_transform=verbatim.
@@ -55,6 +58,19 @@ func (b *PublisherBuilder) WithLogger(l *zap.Logger) *PublisherBuilder {
 	return b
 }
 
+// WithMeterProvider attaches an OTel MeterProvider. nil disables metrics.
+func (b *PublisherBuilder) WithMeterProvider(mp metric.MeterProvider) *PublisherBuilder {
+	b.meterProvider = mp
+	return b
+}
+
+// WithClientName sets the vinculum client block name used as a metric
+// label (vinculum.client.name). Empty is fine if metrics aren't wired.
+func (b *PublisherBuilder) WithClientName(name string) *PublisherBuilder {
+	b.clientName = name
+	return b
+}
+
 // Build returns a RedisPubSubPublisher ready to accept OnEvent calls.
 func (b *PublisherBuilder) Build() *RedisPubSubPublisher {
 	return &RedisPubSubPublisher{
@@ -64,5 +80,6 @@ func (b *PublisherBuilder) Build() *RedisPubSubPublisher {
 		xformFunc:    b.xformFunc,
 		defaultXform: b.defaultXform,
 		logger:       b.logger,
+		metrics:      newPubsubMetrics(b.clientName, b.meterProvider),
 	}
 }

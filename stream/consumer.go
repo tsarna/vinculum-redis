@@ -11,6 +11,11 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 )
 
@@ -58,6 +63,9 @@ type RedisStreamConsumer struct {
 	reclaimMinIdle   time.Duration
 	deadLetterStream string
 	deadLetterAfter  int64
+
+	metrics        *streamMetrics
+	tracerProvider trace.TracerProvider
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -190,6 +198,7 @@ func (c *RedisStreamConsumer) reclaimOwn(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("xclaim: %w", err)
 	}
+	c.metrics.RecordReclaimed(ctx, c.streamName, c.group, int64(len(claimed)))
 	// Claimed entries are now in our PEL but XREADGROUP > won't redeliver
 	// them. Run them through the delivery path directly so subscribers see
 	// them on Start without waiting for a new XADD.
@@ -333,6 +342,7 @@ func (c *RedisStreamConsumer) maybeDeadLetter(ctx context.Context, streamName st
 	if err := c.client.XAck(ctx, streamName, c.group, entry.ID).Err(); err != nil {
 		return false, fmt.Errorf("xack: %w", err)
 	}
+	c.metrics.RecordDeadLettered(ctx, streamName, c.deadLetterStream)
 	return true, nil
 }
 
@@ -342,10 +352,51 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 		return err
 	}
 
+	// Extract W3C trace context from the entry's traceparent/tracestate
+	// fields (written by the Vinculum producer). Streams are a persistent
+	// log — producer and consumer can be minutes or hours apart, possibly
+	// across process restarts — so we do NOT make the producer span the
+	// parent. Instead we start a fresh root span and attach the producer
+	// context as a link. This matches the OTel messaging semconv guidance
+	// for batched/async consumers.
+	carrier := mapCarrier{}
+	for _, k := range []string{"traceparent", "tracestate"} {
+		if v, ok := entry.Values[k]; ok {
+			carrier[k] = asString(v)
+		}
+	}
+	producerCtx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+	tp := c.tracerProvider
+	if tp == nil {
+		tp = noop.NewTracerProvider()
+	}
+	startOpts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithNewRoot(),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "redis"),
+			attribute.String("messaging.destination.name", streamName),
+			attribute.String("messaging.consumer.group.name", c.group),
+			attribute.String("messaging.destination.subscription.name", c.consumerName),
+			attribute.String("messaging.message.id", entry.ID),
+			attribute.String("messaging.operation.name", "process"),
+		),
+	}
+	if psc := trace.SpanContextFromContext(producerCtx); psc.IsValid() {
+		startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: psc}))
+	}
+	ctx, span := tp.Tracer("github.com/tsarna/vinculum-redis/stream").
+		Start(ctx, "process "+streamName, startOpts...)
+	defer span.End()
+
 	topic := streamName
 	if c.topicFunc != nil {
 		out, err := c.topicFunc(streamName, entry.ID, msg, fields)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			c.metrics.RecordError(ctx, "process", "vinculum_topic")
 			return fmt.Errorf("vinculum_topic: %w", err)
 		}
 		if out != "" {
@@ -353,7 +404,14 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 		}
 	}
 
-	return c.target.OnEvent(ctx, topic, msg, fields)
+	if err := c.target.OnEvent(ctx, topic, msg, fields); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		c.metrics.RecordError(ctx, "process", "deliver")
+		return err
+	}
+	c.metrics.RecordConsumed(ctx, streamName, c.group, c.consumerName)
+	return nil
 }
 
 // parseEntry extracts payload + fields from a stream entry using the
@@ -371,6 +429,11 @@ func (c *RedisStreamConsumer) parseEntry(entry goredis.XMessage) (any, map[strin
 			continue // not a user field; origin topic is the Vinculum producer's hint
 		}
 		if c.contentTypeField != "" && k == c.contentTypeField {
+			continue
+		}
+		if k == "traceparent" || k == "tracestate" {
+			// Trace context already consumed by the propagator; keep it
+			// out of the business fields map.
 			continue
 		}
 		switch c.fieldsMode {
