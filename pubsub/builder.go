@@ -3,19 +3,21 @@ package pubsub
 import (
 	goredis "github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
 
 // PublisherBuilder constructs a RedisPubSubPublisher.
 type PublisherBuilder struct {
-	name          string
-	clientName    string
-	client        goredis.UniversalClient
-	mappings      []ChannelMapping
-	xformFunc     ChannelFunc
-	defaultXform  DefaultChannelTransform
-	logger        *zap.Logger
-	meterProvider metric.MeterProvider
+	name           string
+	clientName     string
+	client         goredis.UniversalClient
+	mappings       []ChannelMapping
+	xformFunc      ChannelFunc
+	defaultXform   DefaultChannelTransform
+	logger         *zap.Logger
+	meterProvider  metric.MeterProvider
+	tracerProvider trace.TracerProvider
 }
 
 // NewPublisher returns a PublisherBuilder with default_channel_transform=verbatim.
@@ -71,15 +73,23 @@ func (b *PublisherBuilder) WithClientName(name string) *PublisherBuilder {
 	return b
 }
 
+// WithTracerProvider attaches an OTel TracerProvider. nil uses the global
+// provider via trace/noop fallback.
+func (b *PublisherBuilder) WithTracerProvider(tp trace.TracerProvider) *PublisherBuilder {
+	b.tracerProvider = tp
+	return b
+}
+
 // Build returns a RedisPubSubPublisher ready to accept OnEvent calls.
 func (b *PublisherBuilder) Build() *RedisPubSubPublisher {
 	return &RedisPubSubPublisher{
-		name:         b.name,
-		client:       b.client,
-		mappings:     b.mappings,
-		xformFunc:    b.xformFunc,
-		defaultXform: b.defaultXform,
-		logger:       b.logger,
-		metrics:      newPubsubMetrics(b.clientName, b.meterProvider),
+		name:           b.name,
+		client:         b.client,
+		mappings:       b.mappings,
+		xformFunc:      b.xformFunc,
+		defaultXform:   b.defaultXform,
+		logger:         b.logger,
+		metrics:        newPubsubMetrics(b.clientName, b.meterProvider),
+		tracerProvider: b.tracerProvider,
 	}
 }

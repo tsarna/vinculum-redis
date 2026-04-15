@@ -100,6 +100,7 @@ func (c *RedisStreamConsumer) Start(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.running.Add(1)
+	c.metrics.AddConnected(ctx, c.streamName, c.group, 1)
 	go c.runLoop(runCtx)
 	return nil
 }
@@ -110,6 +111,7 @@ func (c *RedisStreamConsumer) Ack(ctx context.Context, id string) error {
 	if err := c.client.XAck(ctx, c.streamName, c.group, id).Err(); err != nil {
 		return fmt.Errorf("redis_stream consumer %q: xack %s: %w", c.name, id, err)
 	}
+	c.metrics.AddPending(ctx, c.streamName, c.group, -1)
 	return nil
 }
 
@@ -131,6 +133,7 @@ func (c *RedisStreamConsumer) Stop() error {
 	}
 	cancel()
 	c.running.Wait()
+	c.metrics.AddConnected(context.Background(), c.streamName, c.group, -1)
 	return nil
 }
 
@@ -203,6 +206,7 @@ func (c *RedisStreamConsumer) reclaimOwn(ctx context.Context) error {
 	// them. Run them through the delivery path directly so subscribers see
 	// them on Start without waiting for a new XADD.
 	for _, entry := range claimed {
+		c.metrics.AddPending(ctx, c.streamName, c.group, 1)
 		if err := c.deliver(ctx, c.streamName, entry); err != nil {
 			c.logger.Warn("redis_stream consumer: reclaim deliver",
 				zap.String("consumer", c.name),
@@ -216,6 +220,8 @@ func (c *RedisStreamConsumer) reclaimOwn(ctx context.Context) error {
 					zap.String("consumer", c.name),
 					zap.String("id", entry.ID),
 					zap.Error(err))
+			} else {
+				c.metrics.AddPending(ctx, c.streamName, c.group, -1)
 			}
 		}
 	}
@@ -235,6 +241,7 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		start := time.Now()
 		streams, err := c.client.XReadGroup(ctx, &goredis.XReadGroupArgs{
 			Group:    c.group,
 			Consumer: c.consumerName,
@@ -242,6 +249,7 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 			Count:    c.batchSize,
 			Block:    c.blockTimeout,
 		}).Result()
+		c.metrics.RecordReceiveDuration(ctx, c.streamName, time.Since(start).Seconds())
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -268,6 +276,8 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 
 		for _, s := range streams {
 			for _, entry := range s.Messages {
+				// Entry is now in this consumer's PEL until ACK or DLQ.
+				c.metrics.AddPending(ctx, s.Stream, c.group, 1)
 				if err := c.deliver(ctx, s.Stream, entry); err != nil {
 					c.logger.Warn("redis_stream consumer: deliver",
 						zap.String("consumer", c.name),
@@ -297,6 +307,8 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 							zap.String("stream", s.Stream),
 							zap.String("id", entry.ID),
 							zap.Error(err))
+					} else {
+						c.metrics.AddPending(ctx, s.Stream, c.group, -1)
 					}
 				}
 			}
@@ -342,6 +354,7 @@ func (c *RedisStreamConsumer) maybeDeadLetter(ctx context.Context, streamName st
 	if err := c.client.XAck(ctx, streamName, c.group, entry.ID).Err(); err != nil {
 		return false, fmt.Errorf("xack: %w", err)
 	}
+	c.metrics.AddPending(ctx, streamName, c.group, -1)
 	c.metrics.RecordDeadLettered(ctx, streamName, c.deadLetterStream)
 	return true, nil
 }
@@ -404,7 +417,10 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 		}
 	}
 
-	if err := c.target.OnEvent(ctx, topic, msg, fields); err != nil {
+	start := time.Now()
+	err = c.target.OnEvent(ctx, topic, msg, fields)
+	c.metrics.RecordProcessDuration(ctx, streamName, c.group, time.Since(start).Seconds())
+	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		c.metrics.RecordError(ctx, "process", "deliver")

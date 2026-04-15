@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/amir-yaghoubi/mqttpattern"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/tsarna/go2cty2go"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/zclconf/go-cty/cty"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 )
 
@@ -49,13 +54,22 @@ type ChannelMapping struct {
 type RedisPubSubPublisher struct {
 	bus.BaseSubscriber
 
-	name         string
-	client       goredis.UniversalClient
-	mappings     []ChannelMapping
-	xformFunc    ChannelFunc
-	defaultXform DefaultChannelTransform
-	logger       *zap.Logger
-	metrics      *pubsubMetrics
+	name           string
+	client         goredis.UniversalClient
+	mappings       []ChannelMapping
+	xformFunc      ChannelFunc
+	defaultXform   DefaultChannelTransform
+	logger         *zap.Logger
+	metrics        *pubsubMetrics
+	tracerProvider trace.TracerProvider
+}
+
+func (p *RedisPubSubPublisher) tracer() trace.Tracer {
+	tp := p.tracerProvider
+	if tp == nil {
+		tp = noop.NewTracerProvider()
+	}
+	return tp.Tracer("github.com/tsarna/vinculum-redis/pubsub")
 }
 
 // OnEvent resolves the target Redis channel, serializes the payload, and
@@ -74,7 +88,22 @@ func (p *RedisPubSubPublisher) OnEvent(ctx context.Context, topic string, msg an
 		return fmt.Errorf("redis_pubsub publisher %q: serialize: %w", p.name, err)
 	}
 
-	if err := p.client.Publish(ctx, channel, payload).Err(); err != nil {
+	ctx, span := p.tracer().Start(ctx, "send "+channel,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "redis"),
+			attribute.String("messaging.destination.name", channel),
+			attribute.String("messaging.operation.name", "publish"),
+		),
+	)
+	defer span.End()
+
+	start := time.Now()
+	err = p.client.Publish(ctx, channel, payload).Err()
+	p.metrics.RecordPublishDuration(ctx, channel, time.Since(start).Seconds())
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		p.metrics.RecordError(ctx, "publish", "publish")
 		return fmt.Errorf("redis_pubsub publisher %q: publish to %q: %w", p.name, channel, err)
 	}

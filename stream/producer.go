@@ -150,13 +150,14 @@ func (p *RedisStreamProducer) OnEvent(ctx context.Context, topic string, msg any
 	}
 
 	start := time.Now()
-	if _, err := p.client.XAdd(ctx, args).Result(); err != nil {
+	_, err = p.client.XAdd(ctx, args).Result()
+	p.metrics.RecordPublishDuration(ctx, streamName, time.Since(start).Seconds())
+	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		p.metrics.RecordError(ctx, "publish", "xadd")
 		return fmt.Errorf("redis_stream producer %q: XADD %q: %w", p.name, streamName, err)
 	}
-	_ = start
 	p.metrics.RecordSent(ctx, streamName)
 	return nil
 }

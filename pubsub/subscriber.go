@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/amir-yaghoubi/mqttpattern"
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 )
 
@@ -41,10 +46,11 @@ func (s ChannelSubscription) IsPattern() bool {
 type RedisPubSubSubscriber struct {
 	name          string
 	client        goredis.UniversalClient
-	subscriptions []ChannelSubscription
-	target        bus.Subscriber
-	logger        *zap.Logger
-	metrics       *pubsubMetrics
+	subscriptions  []ChannelSubscription
+	target         bus.Subscriber
+	logger         *zap.Logger
+	metrics        *pubsubMetrics
+	tracerProvider trace.TracerProvider
 
 	mu      sync.Mutex
 	ps      *goredis.PubSub
@@ -91,6 +97,8 @@ func (s *RedisPubSubSubscriber) Start(ctx context.Context) error {
 	s.ps = ps
 	s.cancel = cancel
 
+	s.metrics.AddConnected(ctx, 1)
+
 	s.running.Add(1)
 	go s.run(runCtx, ps)
 
@@ -110,6 +118,7 @@ func (s *RedisPubSubSubscriber) Stop() error {
 	cancel()
 	_ = ps.Close()
 	s.running.Wait()
+	s.metrics.AddConnected(context.Background(), -1)
 	return nil
 }
 
@@ -149,7 +158,31 @@ func (s *RedisPubSubSubscriber) deliver(ctx context.Context, msg *goredis.Messag
 		}
 	}
 
-	if err := s.target.OnEvent(ctx, topic, payload, fields); err != nil {
+	// Pub/sub has no header mechanism for trace propagation and the spec
+	// explicitly opts out, so we start a fresh root consumer span per
+	// delivered message rather than linking to a producer context.
+	tp := s.tracerProvider
+	if tp == nil {
+		tp = noop.NewTracerProvider()
+	}
+	ctx, span := tp.Tracer("github.com/tsarna/vinculum-redis/pubsub").
+		Start(ctx, "process "+msg.Channel,
+			trace.WithSpanKind(trace.SpanKindConsumer),
+			trace.WithNewRoot(),
+			trace.WithAttributes(
+				attribute.String("messaging.system", "redis"),
+				attribute.String("messaging.destination.name", msg.Channel),
+				attribute.String("messaging.operation.name", "process"),
+			),
+		)
+	defer span.End()
+
+	start := time.Now()
+	err := s.target.OnEvent(ctx, topic, payload, fields)
+	s.metrics.RecordProcessDuration(ctx, msg.Channel, time.Since(start).Seconds())
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		s.metrics.RecordError(ctx, "process", "deliver")
 		return err
 	}

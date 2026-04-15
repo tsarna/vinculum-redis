@@ -17,6 +17,10 @@ type streamMetrics struct {
 	errors       metric.Int64Counter
 	reclaimed    metric.Int64Counter
 	deadLettered metric.Int64Counter
+	opDuration   metric.Float64Histogram
+	procDur      metric.Float64Histogram
+	connected    metric.Int64UpDownCounter
+	pending      metric.Int64UpDownCounter
 	clientTag    attribute.KeyValue
 }
 
@@ -35,12 +39,26 @@ func newStreamMetrics(clientName string, mp metric.MeterProvider) *streamMetrics
 		metric.WithDescription("Pending entries claimed on startup"))
 	deadLettered, _ := m.Int64Counter("vinculum.messaging.stream.dead_lettered",
 		metric.WithDescription("Entries moved to the dead-letter stream"))
+	opDur, _ := m.Float64Histogram("messaging.client.operation.duration",
+		metric.WithUnit("s"),
+		metric.WithDescription("XADD/XREADGROUP round-trip duration, seconds"))
+	procDur, _ := m.Float64Histogram("messaging.process.duration",
+		metric.WithUnit("s"),
+		metric.WithDescription("Consumer action/delivery duration, seconds"))
+	connected, _ := m.Int64UpDownCounter("vinculum.messaging.connected",
+		metric.WithDescription("1 while a consumer poll loop is running, 0 otherwise"))
+	pending, _ := m.Int64UpDownCounter("vinculum.messaging.stream.pending",
+		metric.WithDescription("Unacked entries currently owned by this consumer"))
 	return &streamMetrics{
 		sent:         sent,
 		consumed:     consumed,
 		errors:       errors,
 		reclaimed:    reclaimed,
 		deadLettered: deadLettered,
+		opDuration:   opDur,
+		procDur:      procDur,
+		connected:    connected,
+		pending:      pending,
 		clientTag:    attribute.String("vinculum.client.name", clientName),
 	}
 }
@@ -91,6 +109,52 @@ func (m *streamMetrics) RecordDeadLettered(ctx context.Context, stream, dlq stri
 		attribute.String("messaging.system", "redis"),
 		attribute.String("messaging.destination.name", stream),
 		attribute.String("vinculum.dead_letter.stream", dlq),
+		m.clientTag,
+	))
+}
+
+func (m *streamMetrics) RecordPublishDuration(ctx context.Context, stream string, seconds float64) {
+	m.opDuration.Record(ctx, seconds, metric.WithAttributes(
+		attribute.String("messaging.system", "redis"),
+		attribute.String("messaging.destination.name", stream),
+		attribute.String("messaging.operation.name", "publish"),
+		m.clientTag,
+	))
+}
+
+func (m *streamMetrics) RecordReceiveDuration(ctx context.Context, stream string, seconds float64) {
+	m.opDuration.Record(ctx, seconds, metric.WithAttributes(
+		attribute.String("messaging.system", "redis"),
+		attribute.String("messaging.destination.name", stream),
+		attribute.String("messaging.operation.name", "receive"),
+		m.clientTag,
+	))
+}
+
+func (m *streamMetrics) RecordProcessDuration(ctx context.Context, stream, group string, seconds float64) {
+	m.procDur.Record(ctx, seconds, metric.WithAttributes(
+		attribute.String("messaging.system", "redis"),
+		attribute.String("messaging.destination.name", stream),
+		attribute.String("messaging.consumer.group.name", group),
+		attribute.String("messaging.operation.name", "process"),
+		m.clientTag,
+	))
+}
+
+func (m *streamMetrics) AddConnected(ctx context.Context, stream, group string, delta int64) {
+	m.connected.Add(ctx, delta, metric.WithAttributes(
+		attribute.String("messaging.system", "redis"),
+		attribute.String("messaging.destination.name", stream),
+		attribute.String("messaging.consumer.group.name", group),
+		m.clientTag,
+	))
+}
+
+func (m *streamMetrics) AddPending(ctx context.Context, stream, group string, delta int64) {
+	m.pending.Add(ctx, delta, metric.WithAttributes(
+		attribute.String("messaging.system", "redis"),
+		attribute.String("messaging.destination.name", stream),
+		attribute.String("messaging.consumer.group.name", group),
 		m.clientTag,
 	))
 }
