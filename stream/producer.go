@@ -8,10 +8,8 @@ import (
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
-	"github.com/tsarna/go2cty2go"
 	bus "github.com/tsarna/vinculum-bus"
 	wire "github.com/tsarna/vinculum-wire"
-	"github.com/zclconf/go-cty/cty"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -199,15 +197,6 @@ func defaultStreamName(topic string) string {
 }
 
 func (p *RedisStreamProducer) buildValues(topic string, msg any, fields map[string]string) (map[string]interface{}, error) {
-	// Convert cty.Value to native Go before wire-format serialization.
-	if val, ok := msg.(cty.Value); ok {
-		native, err := go2cty2go.CtyToAny(val)
-		if err != nil {
-			return nil, fmt.Errorf("cty conversion: %w", err)
-		}
-		msg = native
-	}
-
 	payload, err := p.wireFormat.Serialize(msg)
 	if err != nil {
 		return nil, err

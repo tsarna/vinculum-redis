@@ -7,10 +7,8 @@ import (
 
 	"github.com/amir-yaghoubi/mqttpattern"
 	goredis "github.com/redis/go-redis/v9"
-	"github.com/tsarna/go2cty2go"
 	bus "github.com/tsarna/vinculum-bus"
 	wire "github.com/tsarna/vinculum-wire"
-	"github.com/zclconf/go-cty/cty"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -82,15 +80,6 @@ func (p *RedisPubSubPublisher) OnEvent(ctx context.Context, topic string, msg an
 	}
 	if !ok {
 		return nil
-	}
-
-	// Convert cty.Value to native Go before wire-format serialization.
-	if val, ok := msg.(cty.Value); ok {
-		native, err := go2cty2go.CtyToAny(val)
-		if err != nil {
-			return fmt.Errorf("redis_pubsub publisher %q: cty conversion: %w", p.name, err)
-		}
-		msg = native
 	}
 
 	payload, err := p.wireFormat.Serialize(msg)
