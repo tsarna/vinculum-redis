@@ -2,7 +2,6 @@ package pubsub
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +10,7 @@ import (
 	"github.com/amir-yaghoubi/mqttpattern"
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -48,6 +48,7 @@ type RedisPubSubSubscriber struct {
 	client        goredis.UniversalClient
 	subscriptions  []ChannelSubscription
 	target         bus.Subscriber
+	wireFormat     wire.WireFormat
 	logger         *zap.Logger
 	metrics        *pubsubMetrics
 	tracerProvider trace.TracerProvider
@@ -145,7 +146,17 @@ func (s *RedisPubSubSubscriber) run(ctx context.Context, ps *goredis.PubSub) {
 
 func (s *RedisPubSubSubscriber) deliver(ctx context.Context, msg *goredis.Message) error {
 	matchedPattern, fields := s.extractFields(msg)
-	payload := deserializePayload([]byte(msg.Payload))
+	var payload any
+	if msg.Payload != "" {
+		var deserErr error
+		payload, deserErr = s.wireFormat.Deserialize([]byte(msg.Payload))
+		if deserErr != nil {
+			s.logger.Warn("redis_pubsub subscriber: deserialize failed, passing raw bytes",
+				zap.String("channel", msg.Channel),
+				zap.Error(deserErr))
+			payload = []byte(msg.Payload)
+		}
+	}
 
 	topic := msg.Channel
 	if fn := s.topicFuncFor(msg, matchedPattern); fn != nil {
@@ -243,15 +254,3 @@ func splitSubscriptions(subs []ChannelSubscription) (exact, patterns []string) {
 	return
 }
 
-// deserializePayload mirrors vinculum-mqtt/subscriber.deserializePayload:
-// valid JSON → decoded any; anything else → raw bytes.
-func deserializePayload(payload []byte) any {
-	if payload == nil {
-		return nil
-	}
-	var v any
-	if err := json.Unmarshal(payload, &v); err != nil {
-		return payload
-	}
-	return v
-}

@@ -11,6 +11,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -57,6 +58,7 @@ type RedisStreamConsumer struct {
 	topicField       string
 	contentTypeField string
 	fieldsMode       FieldsMode
+	wireFormat       wire.WireFormat
 	logger           *zap.Logger
 
 	reclaimPending   bool
@@ -438,7 +440,18 @@ func (c *RedisStreamConsumer) parseEntry(entry goredis.XMessage) (any, map[strin
 
 	for k, v := range entry.Values {
 		if c.payloadField != "" && k == c.payloadField {
-			payload = deserializePayload(asBytes(v))
+			raw := asBytes(v)
+			if raw != nil {
+				var deserErr error
+				payload, deserErr = c.wireFormat.Deserialize(raw)
+				if deserErr != nil {
+					c.logger.Warn("redis_stream consumer: deserialize failed, passing raw bytes",
+						zap.String("stream", c.streamName),
+						zap.String("entry_id", entry.ID),
+						zap.Error(deserErr))
+					payload = raw
+				}
+			}
 			continue
 		}
 		if c.topicField != "" && k == c.topicField {
@@ -500,15 +513,3 @@ func asString(v any) string {
 	}
 }
 
-// deserializePayload mirrors vinculum-mqtt/subscriber.deserializePayload:
-// valid JSON → decoded any; anything else → raw bytes.
-func deserializePayload(payload []byte) any {
-	if payload == nil {
-		return nil
-	}
-	var v any
-	if err := json.Unmarshal(payload, &v); err != nil {
-		return payload
-	}
-	return v
-}

@@ -142,7 +142,8 @@ func TestProducerCustomFieldNames(t *testing.T) {
 	require.NoError(t, p.OnEvent(context.Background(), "x", "hi", nil))
 	entries := readAll(t, c, "x")
 	require.Len(t, entries, 1)
-	assert.JSONEq(t, `"hi"`, entries[0].Values["body"].(string))
+	// auto format passes strings through verbatim (not JSON-encoded)
+	assert.Equal(t, "hi", entries[0].Values["body"].(string))
 	_, hasTopic := entries[0].Values["topic"]
 	_, hasCT := entries[0].Values["datacontenttype"]
 	assert.False(t, hasTopic)

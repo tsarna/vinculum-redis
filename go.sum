@@ -41,6 +41,8 @@ github.com/tsarna/go2cty2go v0.1.2 h1:mSEqG5eHUkqaABA1XRgLoLpyEgN99XBZojuZqbFxFk
 github.com/tsarna/go2cty2go v0.1.2/go.mod h1:IRpRWApZVoPjsCKzI2Yptu5Y1jySTSykG2wMETwoWXc=
 github.com/tsarna/vinculum-bus v0.11.0 h1:vg2HbElFoh0s6vmPnTvcNwbccO2/qp7o5nYTTC8l5sw=
 github.com/tsarna/vinculum-bus v0.11.0/go.mod h1:fwVN24q/2iKXvtZQeiRB0tW41WsGWsV6nyvwetB25fA=
+github.com/tsarna/vinculum-wire v0.1.0 h1:GWvDcuYBYkceC/hzwUYUvMqFI+yThxEwbYmjYSQIQ18=
+github.com/tsarna/vinculum-wire v0.1.0/go.mod h1:hh64ALOi1PX+YfFpnKTFL/y0X79mvaDuTepRaiNHN7w=
 github.com/yuin/gopher-lua v1.1.1 h1:kYKnWBjvbNP4XLT3+bPEwAXJx262OhaHDWDVOPjL46M=
 github.com/yuin/gopher-lua v1.1.1/go.mod h1:GBR0iDaNXjAgGg9zfCvksxSRnQx76gclCIb7kdAd1Pw=
 github.com/zclconf/go-cty v1.18.0 h1:pJ8+HNI4gFoyRNqVE37wWbJWVw43BZczFo7KUoRczaA=

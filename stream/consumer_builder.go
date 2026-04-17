@@ -5,6 +5,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -28,6 +29,7 @@ type ConsumerBuilder struct {
 	topicField       string
 	contentTypeField string
 	fieldsMode       FieldsMode
+	wireFormat       wire.WireFormat
 	reclaimPending   bool
 	reclaimMinIdle   time.Duration
 	deadLetterStream string
@@ -140,6 +142,18 @@ func (b *ConsumerBuilder) WithContentTypeField(s string) *ConsumerBuilder {
 	return b
 }
 
+// WithWireFormat sets the wire format used to deserialize inbound payloads.
+func (b *ConsumerBuilder) WithWireFormat(f wire.WireFormat) *ConsumerBuilder {
+	b.wireFormat = f
+	return b
+}
+
+// WithWireFormatName sets the wire format by name (e.g. "json", "auto").
+func (b *ConsumerBuilder) WithWireFormatName(name string) *ConsumerBuilder {
+	b.wireFormat = wire.ByName(name)
+	return b
+}
+
 func (b *ConsumerBuilder) WithFieldsMode(m FieldsMode) *ConsumerBuilder {
 	b.fieldsMode = m
 	return b
@@ -169,6 +183,10 @@ func (b *ConsumerBuilder) WithClientName(name string) *ConsumerBuilder {
 }
 
 func (b *ConsumerBuilder) Build() *RedisStreamConsumer {
+	wf := b.wireFormat
+	if wf == nil {
+		wf = wire.Auto
+	}
 	return &RedisStreamConsumer{
 		name:             b.name,
 		client:           b.client,
@@ -185,6 +203,7 @@ func (b *ConsumerBuilder) Build() *RedisStreamConsumer {
 		topicField:       b.topicField,
 		contentTypeField: b.contentTypeField,
 		fieldsMode:       b.fieldsMode,
+		wireFormat:       wf,
 		reclaimPending:   b.reclaimPending,
 		reclaimMinIdle:   b.reclaimMinIdle,
 		deadLetterStream: b.deadLetterStream,

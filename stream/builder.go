@@ -2,6 +2,7 @@ package stream
 
 import (
 	goredis "github.com/redis/go-redis/v9"
+	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -20,6 +21,7 @@ type ProducerBuilder struct {
 	topicField        string
 	contentTypeField  string
 	fieldsMode        FieldsMode
+	wireFormat        wire.WireFormat
 	logger            *zap.Logger
 	meterProvider     metric.MeterProvider
 	tracerProvider    trace.TracerProvider
@@ -85,6 +87,18 @@ func (b *ProducerBuilder) WithContentTypeField(name string) *ProducerBuilder {
 	return b
 }
 
+// WithWireFormat sets the wire format used to serialize outbound payloads.
+func (b *ProducerBuilder) WithWireFormat(f wire.WireFormat) *ProducerBuilder {
+	b.wireFormat = f
+	return b
+}
+
+// WithWireFormatName sets the wire format by name (e.g. "json", "auto").
+func (b *ProducerBuilder) WithWireFormatName(name string) *ProducerBuilder {
+	b.wireFormat = wire.ByName(name)
+	return b
+}
+
 func (b *ProducerBuilder) WithFieldsMode(m FieldsMode) *ProducerBuilder {
 	b.fieldsMode = m
 	return b
@@ -114,6 +128,10 @@ func (b *ProducerBuilder) WithClientName(name string) *ProducerBuilder {
 }
 
 func (b *ProducerBuilder) Build() *RedisStreamProducer {
+	wf := b.wireFormat
+	if wf == nil {
+		wf = wire.Auto
+	}
 	return &RedisStreamProducer{
 		name:              b.name,
 		client:            b.client,
@@ -125,6 +143,7 @@ func (b *ProducerBuilder) Build() *RedisStreamProducer {
 		topicField:        b.topicField,
 		contentTypeField:  b.contentTypeField,
 		fieldsMode:        b.fieldsMode,
+		wireFormat:        wf,
 		logger:            b.logger,
 		metrics:           newStreamMetrics(b.clientName, b.meterProvider),
 		tracerProvider:    b.tracerProvider,

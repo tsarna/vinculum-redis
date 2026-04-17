@@ -2,7 +2,6 @@ package pubsub
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/tsarna/go2cty2go"
 	bus "github.com/tsarna/vinculum-bus"
+	wire "github.com/tsarna/vinculum-wire"
 	"github.com/zclconf/go-cty/cty"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -59,6 +59,7 @@ type RedisPubSubPublisher struct {
 	mappings       []ChannelMapping
 	xformFunc      ChannelFunc
 	defaultXform   DefaultChannelTransform
+	wireFormat     wire.WireFormat
 	logger         *zap.Logger
 	metrics        *pubsubMetrics
 	tracerProvider trace.TracerProvider
@@ -83,7 +84,16 @@ func (p *RedisPubSubPublisher) OnEvent(ctx context.Context, topic string, msg an
 		return nil
 	}
 
-	payload, err := serializePayload(msg)
+	// Convert cty.Value to native Go before wire-format serialization.
+	if val, ok := msg.(cty.Value); ok {
+		native, err := go2cty2go.CtyToAny(val)
+		if err != nil {
+			return fmt.Errorf("redis_pubsub publisher %q: cty conversion: %w", p.name, err)
+		}
+		msg = native
+	}
+
+	payload, err := p.wireFormat.Serialize(msg)
 	if err != nil {
 		return fmt.Errorf("redis_pubsub publisher %q: serialize: %w", p.name, err)
 	}
@@ -166,29 +176,6 @@ func mergeFields(a, b map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
-}
-
-// serializePayload mirrors vinculum-mqtt/publisher.serializePayload:
-//
-//   - []byte    → pass through unchanged
-//   - cty.Value → go2cty2go.CtyToAny → json.Marshal
-//   - nil       → nil
-//   - any other → json.Marshal
-func serializePayload(msg any) ([]byte, error) {
-	if msg == nil {
-		return nil, nil
-	}
-	if val, ok := msg.(cty.Value); ok {
-		var err error
-		msg, err = go2cty2go.CtyToAny(val)
-		if err != nil {
-			return nil, fmt.Errorf("cty conversion: %w", err)
-		}
-	}
-	if b, ok := msg.([]byte); ok {
-		return b, nil
-	}
-	return json.Marshal(msg)
 }
 
 var _ bus.Subscriber = (*RedisPubSubPublisher)(nil)

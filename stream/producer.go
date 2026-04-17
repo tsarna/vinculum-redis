@@ -10,6 +10,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/tsarna/go2cty2go"
 	bus "github.com/tsarna/vinculum-bus"
+	wire "github.com/tsarna/vinculum-wire"
 	"github.com/zclconf/go-cty/cty"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -68,6 +69,7 @@ type RedisStreamProducer struct {
 	topicField        string
 	contentTypeField  string
 	fieldsMode        FieldsMode
+	wireFormat        wire.WireFormat
 	logger            *zap.Logger
 	metrics           *streamMetrics
 	tracerProvider    trace.TracerProvider
@@ -197,7 +199,16 @@ func defaultStreamName(topic string) string {
 }
 
 func (p *RedisStreamProducer) buildValues(topic string, msg any, fields map[string]string) (map[string]interface{}, error) {
-	payload, err := serializePayload(msg)
+	// Convert cty.Value to native Go before wire-format serialization.
+	if val, ok := msg.(cty.Value); ok {
+		native, err := go2cty2go.CtyToAny(val)
+		if err != nil {
+			return nil, fmt.Errorf("cty conversion: %w", err)
+		}
+		msg = native
+	}
+
+	payload, err := p.wireFormat.Serialize(msg)
 	if err != nil {
 		return nil, err
 	}
@@ -237,29 +248,6 @@ func (p *RedisStreamProducer) buildValues(topic string, msg any, fields map[stri
 	}
 
 	return values, nil
-}
-
-// serializePayload mirrors the pubsub publisher path:
-//
-//   - []byte    → pass through unchanged
-//   - cty.Value → go2cty2go.CtyToAny → json.Marshal
-//   - nil       → nil
-//   - any other → json.Marshal
-func serializePayload(msg any) ([]byte, error) {
-	if msg == nil {
-		return nil, nil
-	}
-	if val, ok := msg.(cty.Value); ok {
-		var err error
-		msg, err = go2cty2go.CtyToAny(val)
-		if err != nil {
-			return nil, fmt.Errorf("cty conversion: %w", err)
-		}
-	}
-	if b, ok := msg.([]byte); ok {
-		return b, nil
-	}
-	return json.Marshal(msg)
 }
 
 var _ bus.Subscriber = (*RedisStreamProducer)(nil)

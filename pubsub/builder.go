@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	goredis "github.com/redis/go-redis/v9"
+	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -15,6 +16,7 @@ type PublisherBuilder struct {
 	mappings       []ChannelMapping
 	xformFunc      ChannelFunc
 	defaultXform   DefaultChannelTransform
+	wireFormat     wire.WireFormat
 	logger         *zap.Logger
 	meterProvider  metric.MeterProvider
 	tracerProvider trace.TracerProvider
@@ -52,6 +54,18 @@ func (b *PublisherBuilder) WithDefaultTransform(t DefaultChannelTransform) *Publ
 	return b
 }
 
+// WithWireFormat sets the wire format used to serialize outbound payloads.
+func (b *PublisherBuilder) WithWireFormat(f wire.WireFormat) *PublisherBuilder {
+	b.wireFormat = f
+	return b
+}
+
+// WithWireFormatName sets the wire format by name (e.g. "json", "auto").
+func (b *PublisherBuilder) WithWireFormatName(name string) *PublisherBuilder {
+	b.wireFormat = wire.ByName(name)
+	return b
+}
+
 // WithLogger sets the logger.
 func (b *PublisherBuilder) WithLogger(l *zap.Logger) *PublisherBuilder {
 	if l != nil {
@@ -82,12 +96,17 @@ func (b *PublisherBuilder) WithTracerProvider(tp trace.TracerProvider) *Publishe
 
 // Build returns a RedisPubSubPublisher ready to accept OnEvent calls.
 func (b *PublisherBuilder) Build() *RedisPubSubPublisher {
+	wf := b.wireFormat
+	if wf == nil {
+		wf = wire.Auto
+	}
 	return &RedisPubSubPublisher{
 		name:           b.name,
 		client:         b.client,
 		mappings:       b.mappings,
 		xformFunc:      b.xformFunc,
 		defaultXform:   b.defaultXform,
+		wireFormat:     wf,
 		logger:         b.logger,
 		metrics:        newPubsubMetrics(b.clientName, b.meterProvider),
 		tracerProvider: b.tracerProvider,
