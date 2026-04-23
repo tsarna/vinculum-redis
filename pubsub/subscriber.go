@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amir-yaghoubi/mqttpattern"
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	"github.com/tsarna/vinculum-bus/topicmatch"
 	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -219,7 +219,7 @@ func (s *RedisPubSubSubscriber) topicFuncFor(msg *goredis.Message, matchedPatter
 
 // extractFields returns the pattern that matched (for PSUBSCRIBE messages;
 // empty for exact subscriptions) and any named-capture fields extracted by
-// interpreting the Redis pattern as an mqttpattern.
+// interpreting the Redis pattern as an topicmatch.
 func (s *RedisPubSubSubscriber) extractFields(msg *goredis.Message) (string, map[string]string) {
 	if msg.Pattern == "" {
 		return "", nil
@@ -232,7 +232,7 @@ func (s *RedisPubSubSubscriber) extractFields(msg *goredis.Message) (string, map
 	// (matching `+name` literally in channel names, which is fine because
 	// they are not doing that).
 	if strings.Contains(msg.Pattern, "+") {
-		fields := mqttpattern.Extract(msg.Pattern, msg.Channel)
+		fields := topicmatch.Extract(msg.Pattern, msg.Channel)
 		if len(fields) == 0 {
 			return msg.Pattern, nil
 		}

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/amir-yaghoubi/mqttpattern"
 	goredis "github.com/redis/go-redis/v9"
 	bus "github.com/tsarna/vinculum-bus"
+	"github.com/tsarna/vinculum-bus/topicmatch"
 	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -115,10 +115,10 @@ func (p *RedisPubSubPublisher) OnEvent(ctx context.Context, topic string, msg an
 // bool return distinguishes "drop silently" from "empty result".
 func (p *RedisPubSubPublisher) resolveChannel(topic string, msg any, fields map[string]string) (string, bool, error) {
 	for _, m := range p.mappings {
-		if !mqttpattern.Matches(m.Pattern, topic) {
+		if !topicmatch.Matches(m.Pattern, topic) {
 			continue
 		}
-		merged := mergeFields(fields, mqttpattern.Extract(m.Pattern, topic))
+		merged := mergeFields(fields, topicmatch.Extract(m.Pattern, topic))
 		if m.ChannelFunc == nil {
 			return topic, true, nil
 		}
