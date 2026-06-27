@@ -91,6 +91,7 @@ var reservedFields = map[string]struct{}{
 	"fields":          {},
 	"traceparent":     {},
 	"tracestate":      {},
+	"baggage":         {},
 }
 
 // IsReservedField reports whether name is a Vinculum-reserved stream entry

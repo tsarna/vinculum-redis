@@ -14,6 +14,7 @@ import (
 	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -375,7 +376,7 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 	// context as a link. This matches the OTel messaging semconv guidance
 	// for batched/async consumers.
 	carrier := mapCarrier{}
-	for _, k := range []string{"traceparent", "tracestate"} {
+	for _, k := range []string{"traceparent", "tracestate", "baggage"} {
 		if v, ok := entry.Values[k]; ok {
 			carrier[k] = asString(v)
 		}
@@ -404,6 +405,14 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 	ctx, span := tp.Tracer("github.com/tsarna/vinculum-redis/stream").
 		Start(ctx, "process "+streamName, startOpts...)
 	defer span.End()
+
+	// Carry the producer's baggage onto the processing context so it reaches
+	// target.OnEvent and action expressions. The consumer span above stays a new
+	// root linked to the producer span — only baggage rides along, not the span
+	// parent.
+	if bg := baggage.FromContext(producerCtx); bg.Len() > 0 {
+		ctx = baggage.ContextWithBaggage(ctx, bg)
+	}
 
 	topic := streamName
 	if c.topicFunc != nil {
@@ -460,9 +469,9 @@ func (c *RedisStreamConsumer) parseEntry(entry goredis.XMessage) (any, map[strin
 		if c.contentTypeField != "" && k == c.contentTypeField {
 			continue
 		}
-		if k == "traceparent" || k == "tracestate" {
-			// Trace context already consumed by the propagator; keep it
-			// out of the business fields map.
+		if k == "traceparent" || k == "tracestate" || k == "baggage" {
+			// Trace context / baggage already consumed by the propagator; keep
+			// it out of the business fields map.
 			continue
 		}
 		switch c.fieldsMode {
@@ -512,4 +521,3 @@ func asString(v any) string {
 		return fmt.Sprint(v)
 	}
 }
-

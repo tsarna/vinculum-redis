@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## v0.3.1 (2026-06-27)
+
+### Fixed
+
+- **Streams: inbound baggage now reaches `target.OnEvent`.** The stream consumer
+  extracted only `traceparent`/`tracestate` from entry fields, dropping the
+  `baggage` field the producer already writes, so consumers could not read
+  inbound baggage. The consumer now extracts `baggage` too and carries it onto
+  the context passed to `OnEvent` (the consumer span remains a new root linked
+  to the producer — only baggage rides along), and keeps the `baggage` field out
+  of the business `fields` map. `baggage` is also added to the producer's
+  reserved-field set.
+
 ## v0.3.0 (2026-05-27)
 
 ### Changed

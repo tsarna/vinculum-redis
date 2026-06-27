@@ -13,6 +13,7 @@ import (
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/tsarna/vinculum-redis/stream"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -23,15 +24,16 @@ type recorder struct {
 	events []rec
 }
 type rec struct {
+	ctx    context.Context
 	topic  string
 	msg    any
 	fields map[string]string
 }
 
-func (r *recorder) OnEvent(_ context.Context, topic string, msg any, fields map[string]string) error {
+func (r *recorder) OnEvent(ctx context.Context, topic string, msg any, fields map[string]string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.events = append(r.events, rec{topic, msg, fields})
+	r.events = append(r.events, rec{ctx: ctx, topic: topic, msg: msg, fields: fields})
 	return nil
 }
 func (r *recorder) wait(t *testing.T, n int) []rec {
@@ -190,6 +192,50 @@ func TestProducerInjectsTraceContext(t *testing.T) {
 	tpHeader, ok := entries[0].Values["traceparent"].(string)
 	require.True(t, ok, "expected traceparent field in entry values")
 	assert.Contains(t, tpHeader, span.SpanContext().TraceID().String())
+}
+
+func TestConsumerCarriesInboundBaggage(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{}))
+	defer otel.SetTextMapPropagator(prevProp)
+
+	recv := &recorder{}
+	cons := stream.NewConsumer("in", c).
+		WithStream("events").
+		WithGroup("g1").
+		WithConsumerName("c1").
+		WithBlockTimeout(100 * time.Millisecond).
+		WithTarget(recv).
+		Build()
+	require.NoError(t, cons.Start(context.Background()))
+	defer cons.Stop()
+
+	// Produce an entry with baggage set on the context; the producer injects it
+	// as an entry field via the global propagator.
+	m0, _ := baggage.NewMemberRaw("tenant_id", "acme")
+	m1, _ := baggage.NewMemberRaw("secret", "x")
+	bg, _ := baggage.New(m0, m1)
+	ctx := baggage.ContextWithBaggage(context.Background(), bg)
+
+	p := stream.NewProducer("out", c).WithStreamFunc(func(string, any, map[string]string) (string, error) {
+		return "events", nil
+	}).Build()
+	require.NoError(t, p.OnEvent(ctx, "x", "hi", nil))
+
+	evs := recv.wait(t, 1)
+	require.Len(t, evs, 1)
+	// The producer's baggage must reach the consumer's OnEvent context (it
+	// previously did not — only traceparent/tracestate were extracted).
+	got := baggage.FromContext(evs[0].ctx)
+	assert.Equal(t, "acme", got.Member("tenant_id").Value())
+	assert.Equal(t, "x", got.Member("secret").Value())
+	// And it must not leak into the business fields map.
+	assert.NotContains(t, evs[0].fields, "baggage")
 }
 
 func TestConsumerReclaimPending(t *testing.T) {
