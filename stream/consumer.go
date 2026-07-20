@@ -60,6 +60,7 @@ type RedisStreamConsumer struct {
 	contentTypeField string
 	fieldsMode       FieldsMode
 	wireFormat       wire.WireFormat
+	onDecodeError    wire.DecodeErrorHook
 	logger           *zap.Logger
 
 	reclaimPending   bool
@@ -363,7 +364,7 @@ func (c *RedisStreamConsumer) maybeDeadLetter(ctx context.Context, streamName st
 }
 
 func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, entry goredis.XMessage) error {
-	msg, fields, err := c.parseEntry(entry)
+	msg, fields, err := c.parseEntry(ctx, entry)
 	if err != nil {
 		return err
 	}
@@ -443,7 +444,7 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 
 // parseEntry extracts payload + fields from a stream entry using the
 // symmetric payload_field / topic_field / fields_mode configuration.
-func (c *RedisStreamConsumer) parseEntry(entry goredis.XMessage) (any, map[string]string, error) {
+func (c *RedisStreamConsumer) parseEntry(ctx context.Context, entry goredis.XMessage) (any, map[string]string, error) {
 	var payload any
 	fields := make(map[string]string)
 
@@ -454,11 +455,34 @@ func (c *RedisStreamConsumer) parseEntry(entry goredis.XMessage) (any, map[strin
 				var deserErr error
 				payload, deserErr = c.wireFormat.Deserialize(raw)
 				if deserErr != nil {
-					c.logger.Warn("redis_stream consumer: deserialize failed, passing raw bytes",
+					// A decode failure is fatal to the entry: the configured
+					// wire format is a contract, so an entry that doesn't
+					// satisfy it is not delivered. Use wire format "auto"
+					// for best-effort decoding. The entry stays in the PEL
+					// and is dead-lettered once dead_letter_after retries
+					// are exhausted; without dead-lettering configured it
+					// remains pending indefinitely.
+					c.logger.Error("redis_stream consumer: deserialize failed",
 						zap.String("stream", c.streamName),
 						zap.String("entry_id", entry.ID),
+						zap.String("wire_format", c.wireFormat.Name()),
 						zap.Error(deserErr))
-					payload = raw
+					c.metrics.RecordError(ctx, "process", "deserialize")
+					if c.onDecodeError != nil {
+						c.onDecodeError(ctx, wire.DecodeError{
+							Raw:    raw,
+							Err:    deserErr,
+							Format: c.wireFormat.Name(),
+							Topic:  c.streamName,
+							Attrs: map[string]string{
+								"stream":   c.streamName,
+								"entry_id": entry.ID,
+								"group":    c.group,
+								"consumer": c.consumerName,
+							},
+						})
+					}
+					return nil, nil, fmt.Errorf("redis_stream consumer: deserialize entry %s: %w", entry.ID, deserErr)
 				}
 			}
 			continue
@@ -480,6 +504,7 @@ func (c *RedisStreamConsumer) parseEntry(entry goredis.XMessage) (any, map[strin
 		case FieldsNested:
 			if k == "fields" {
 				if err := json.Unmarshal(asBytes(v), &fields); err != nil {
+					c.metrics.RecordError(ctx, "process", "fields_decode")
 					return nil, nil, fmt.Errorf("decode fields: %w", err)
 				}
 			}

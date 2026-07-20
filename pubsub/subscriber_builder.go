@@ -17,6 +17,7 @@ type SubscriberBuilder struct {
 	subscriptions  []ChannelSubscription
 	target         bus.Subscriber
 	wireFormat     wire.WireFormat
+	onDecodeError  wire.DecodeErrorHook
 	logger         *zap.Logger
 	meterProvider  metric.MeterProvider
 	tracerProvider trace.TracerProvider
@@ -70,6 +71,14 @@ func (b *SubscriberBuilder) WithWireFormatName(name string) *SubscriberBuilder {
 	return b
 }
 
+// WithDecodeErrorHook sets an observer invoked when an inbound payload fails
+// to deserialize. The hook cannot suppress the failure: the message is
+// dropped either way. nil (the default) means no observer.
+func (b *SubscriberBuilder) WithDecodeErrorHook(h wire.DecodeErrorHook) *SubscriberBuilder {
+	b.onDecodeError = h
+	return b
+}
+
 // WithTracerProvider attaches an OTel TracerProvider.
 func (b *SubscriberBuilder) WithTracerProvider(tp trace.TracerProvider) *SubscriberBuilder {
 	b.tracerProvider = tp
@@ -87,6 +96,7 @@ func (b *SubscriberBuilder) Build() *RedisPubSubSubscriber {
 		subscriptions:  b.subscriptions,
 		target:         b.target,
 		wireFormat:     wf,
+		onDecodeError:  b.onDecodeError,
 		logger:         b.logger,
 		metrics:        newPubsubMetrics(b.clientName, b.meterProvider),
 		tracerProvider: b.tracerProvider,

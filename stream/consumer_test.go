@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/tsarna/vinculum-redis/stream"
+	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
@@ -305,4 +306,115 @@ func TestConsumerAutoAckFalseLeavesPending(t *testing.T) {
 	pending, err := c.XPending(context.Background(), "events", "g").Result()
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, pending.Count)
+}
+
+// ── strict decode ─────────────────────────────────────────────────────────────
+
+func TestConsumerDecodeErrorIsFatalAndLeavesPending(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	recv := &recorder{}
+	cons := stream.NewConsumer("in", c).
+		WithStream("events").
+		WithGroup("g").
+		WithConsumerName("c").
+		WithBlockTimeout(100 * time.Millisecond).
+		WithWireFormat(wire.JSON).
+		WithTarget(recv).
+		Build()
+	require.NoError(t, cons.Start(context.Background()))
+	defer cons.Stop()
+
+	require.NoError(t, c.XAdd(context.Background(), &goredis.XAddArgs{
+		Stream: "events",
+		Values: map[string]any{"data": "not json {{"},
+	}).Err())
+
+	// Give the consumer time to poll and fail the entry.
+	require.Eventually(t, func() bool {
+		p, err := c.XPending(context.Background(), "events", "g").Result()
+		return err == nil && p.Count == 1
+	}, 3*time.Second, 20*time.Millisecond,
+		"the entry must stay in the PEL, not be ACKed")
+
+	assert.Empty(t, recv.events, "malformed entry must not be delivered")
+}
+
+func TestConsumerDecodeErrorInvokesHook(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	recv := &recorder{}
+	hookCh := make(chan wire.DecodeError, 4)
+
+	cons := stream.NewConsumer("in", c).
+		WithStream("events").
+		WithGroup("g").
+		WithConsumerName("c").
+		WithBlockTimeout(100 * time.Millisecond).
+		WithWireFormat(wire.JSON).
+		WithTarget(recv).
+		WithDecodeErrorHook(func(_ context.Context, e wire.DecodeError) {
+			select {
+			case hookCh <- e:
+			default: // the entry stays pending and may be retried; keep the first
+			}
+		}).
+		Build()
+	require.NoError(t, cons.Start(context.Background()))
+	defer cons.Stop()
+
+	require.NoError(t, c.XAdd(context.Background(), &goredis.XAddArgs{
+		Stream: "events",
+		Values: map[string]any{"data": "not json {{"},
+	}).Err())
+
+	select {
+	case got := <-hookCh:
+		assert.Equal(t, []byte("not json {{"), got.Raw)
+		assert.Equal(t, "json", got.Format)
+		assert.Equal(t, "events", got.Topic)
+		assert.Equal(t, "events", got.Attrs["stream"])
+		assert.Equal(t, "g", got.Attrs["group"])
+		assert.Equal(t, "c", got.Attrs["consumer"])
+		assert.NotEmpty(t, got.Attrs["entry_id"])
+		require.Error(t, got.Err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("on_decode_error hook was not invoked")
+	}
+
+	// The hook observes; it does not suppress.
+	assert.Empty(t, recv.events)
+}
+
+func TestConsumerAutoWireFormatToleratesNonJSON(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	recv := &recorder{}
+	// "auto" is the documented migration path off the old tolerant
+	// behavior: it never fails to decode, yielding a string.
+	cons := stream.NewConsumer("in", c).
+		WithStream("events").
+		WithGroup("g").
+		WithConsumerName("c").
+		WithBlockTimeout(100 * time.Millisecond).
+		WithWireFormat(wire.Auto).
+		WithTarget(recv).
+		Build()
+	require.NoError(t, cons.Start(context.Background()))
+	defer cons.Stop()
+
+	require.NoError(t, c.XAdd(context.Background(), &goredis.XAddArgs{
+		Stream: "events",
+		Values: map[string]any{"data": "not json {{"},
+	}).Err())
+
+	evs := recv.wait(t, 1)
+	require.Len(t, evs, 1)
+	assert.Equal(t, "not json {{", evs[0].msg)
 }

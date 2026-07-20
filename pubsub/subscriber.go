@@ -44,11 +44,12 @@ func (s ChannelSubscription) IsPattern() bool {
 // RedisPubSubSubscriber owns a *redis.PubSub connection and a goroutine
 // that delivers received channel messages to a bus.Subscriber.
 type RedisPubSubSubscriber struct {
-	name          string
-	client        goredis.UniversalClient
+	name           string
+	client         goredis.UniversalClient
 	subscriptions  []ChannelSubscription
 	target         bus.Subscriber
 	wireFormat     wire.WireFormat
+	onDecodeError  wire.DecodeErrorHook
 	logger         *zap.Logger
 	metrics        *pubsubMetrics
 	tracerProvider trace.TracerProvider
@@ -146,15 +147,35 @@ func (s *RedisPubSubSubscriber) run(ctx context.Context, ps *goredis.PubSub) {
 
 func (s *RedisPubSubSubscriber) deliver(ctx context.Context, msg *goredis.Message) error {
 	matchedPattern, fields := s.extractFields(msg)
+	// A decode failure is fatal to the message: the configured wire format
+	// is a contract, so a payload that doesn't satisfy it is dropped rather
+	// than delivered as raw bytes. Use wire format "auto" for best-effort
+	// decoding. Pub/sub has no ack, so the message is simply not delivered.
 	var payload any
 	if msg.Payload != "" {
 		var deserErr error
 		payload, deserErr = s.wireFormat.Deserialize([]byte(msg.Payload))
 		if deserErr != nil {
-			s.logger.Warn("redis_pubsub subscriber: deserialize failed, passing raw bytes",
+			s.logger.Error("redis_pubsub subscriber: deserialize failed",
 				zap.String("channel", msg.Channel),
+				zap.String("wire_format", s.wireFormat.Name()),
 				zap.Error(deserErr))
-			payload = []byte(msg.Payload)
+			s.metrics.RecordError(ctx, "process", "deserialize")
+			if s.onDecodeError != nil {
+				attrs := map[string]string{"channel": msg.Channel}
+				if matchedPattern != "" {
+					attrs["matched_pattern"] = matchedPattern
+				}
+				s.onDecodeError(ctx, wire.DecodeError{
+					Raw:    []byte(msg.Payload),
+					Err:    deserErr,
+					Format: s.wireFormat.Name(),
+					Topic:  msg.Channel,
+					Fields: fields,
+					Attrs:  attrs,
+				})
+			}
+			return fmt.Errorf("redis_pubsub subscriber: deserialize payload for %q: %w", msg.Channel, deserErr)
 		}
 	}
 
@@ -253,4 +274,3 @@ func splitSubscriptions(subs []ChannelSubscription) (exact, patterns []string) {
 	}
 	return
 }
-

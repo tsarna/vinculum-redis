@@ -30,6 +30,7 @@ type ConsumerBuilder struct {
 	contentTypeField string
 	fieldsMode       FieldsMode
 	wireFormat       wire.WireFormat
+	onDecodeError    wire.DecodeErrorHook
 	reclaimPending   bool
 	reclaimMinIdle   time.Duration
 	deadLetterStream string
@@ -154,6 +155,16 @@ func (b *ConsumerBuilder) WithWireFormatName(name string) *ConsumerBuilder {
 	return b
 }
 
+// WithDecodeErrorHook sets an observer invoked when an inbound entry payload
+// fails to deserialize. The hook cannot suppress the failure: the entry is
+// treated as failed either way (left in the PEL, and dead-lettered once
+// dead_letter_after retries are exhausted). nil (the default) means no
+// observer.
+func (b *ConsumerBuilder) WithDecodeErrorHook(h wire.DecodeErrorHook) *ConsumerBuilder {
+	b.onDecodeError = h
+	return b
+}
+
 func (b *ConsumerBuilder) WithFieldsMode(m FieldsMode) *ConsumerBuilder {
 	b.fieldsMode = m
 	return b
@@ -204,6 +215,7 @@ func (b *ConsumerBuilder) Build() *RedisStreamConsumer {
 		contentTypeField: b.contentTypeField,
 		fieldsMode:       b.fieldsMode,
 		wireFormat:       wf,
+		onDecodeError:    b.onDecodeError,
 		reclaimPending:   b.reclaimPending,
 		reclaimMinIdle:   b.reclaimMinIdle,
 		deadLetterStream: b.deadLetterStream,

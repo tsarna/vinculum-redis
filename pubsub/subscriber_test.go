@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/tsarna/vinculum-redis/pubsub"
+	wire "github.com/tsarna/vinculum-wire"
 )
 
 // recordingSub is a trivial bus.Subscriber that buffers received events.
@@ -149,4 +150,85 @@ func TestSubscriberMixedExactAndPattern(t *testing.T) {
 	topics := []string{evs[0].topic, evs[1].topic}
 	assert.Contains(t, topics, "exact")
 	assert.Contains(t, topics, "pat.xyz")
+}
+
+// ── strict decode ─────────────────────────────────────────────────────────────
+
+func TestSubscriberDecodeErrorIsFatalAndNotDelivered(t *testing.T) {
+	_, c := newSubClient(t)
+	rec := &recordingSub{}
+
+	sub := pubsub.NewSubscriber("main", c).
+		WithSubscription(pubsub.ChannelSubscription{Channel: "alerts"}).
+		WithTarget(rec).
+		WithWireFormat(wire.JSON).
+		Build()
+
+	require.NoError(t, sub.Start(context.Background()))
+	defer sub.Stop()
+
+	require.NoError(t, c.Publish(context.Background(), "alerts", "not json {{").Err())
+	// Follow with a well-formed message: once it arrives we know the bad one
+	// has already been processed, without sleeping for a fixed duration.
+	require.NoError(t, c.Publish(context.Background(), "alerts", `{"level":"high"}`).Err())
+
+	evs := rec.wait(t, 1)
+	require.Len(t, evs, 1, "only the well-formed message may be delivered")
+	assert.Equal(t, map[string]any{"level": "high"}, evs[0].msg)
+}
+
+func TestSubscriberDecodeErrorInvokesHook(t *testing.T) {
+	_, c := newSubClient(t)
+	rec := &recordingSub{}
+	hookCh := make(chan wire.DecodeError, 1)
+
+	sub := pubsub.NewSubscriber("main", c).
+		WithSubscription(pubsub.ChannelSubscription{Channel: "alerts"}).
+		WithTarget(rec).
+		WithWireFormat(wire.JSON).
+		WithDecodeErrorHook(func(_ context.Context, e wire.DecodeError) {
+			hookCh <- e
+		}).
+		Build()
+
+	require.NoError(t, sub.Start(context.Background()))
+	defer sub.Stop()
+
+	require.NoError(t, c.Publish(context.Background(), "alerts", "not json {{").Err())
+
+	select {
+	case got := <-hookCh:
+		assert.Equal(t, []byte("not json {{"), got.Raw)
+		assert.Equal(t, "json", got.Format)
+		assert.Equal(t, "alerts", got.Topic)
+		assert.Equal(t, "alerts", got.Attrs["channel"])
+		require.Error(t, got.Err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("on_decode_error hook was not invoked")
+	}
+
+	// The hook observes; it does not suppress.
+	assert.Empty(t, rec.wait(t, 0))
+}
+
+func TestSubscriberAutoWireFormatToleratesNonJSON(t *testing.T) {
+	_, c := newSubClient(t)
+	rec := &recordingSub{}
+
+	// "auto" is the documented migration path off the old tolerant
+	// behavior: it never fails to decode, yielding a string.
+	sub := pubsub.NewSubscriber("main", c).
+		WithSubscription(pubsub.ChannelSubscription{Channel: "alerts"}).
+		WithTarget(rec).
+		WithWireFormat(wire.Auto).
+		Build()
+
+	require.NoError(t, sub.Start(context.Background()))
+	defer sub.Stop()
+
+	require.NoError(t, c.Publish(context.Background(), "alerts", "not json {{").Err())
+
+	evs := rec.wait(t, 1)
+	require.Len(t, evs, 1)
+	assert.Equal(t, "not json {{", evs[0].msg)
 }

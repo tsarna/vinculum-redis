@@ -7,7 +7,7 @@ require (
 	github.com/redis/go-redis/v9 v9.20.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tsarna/vinculum-bus v0.15.1
-	github.com/tsarna/vinculum-wire v0.2.1
+	github.com/tsarna/vinculum-wire v0.3.0
 	github.com/zclconf/go-cty v1.19.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
