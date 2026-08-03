@@ -382,6 +382,14 @@ func TestConsumerDecodeErrorInvokesHook(t *testing.T) {
 		assert.Equal(t, "c", got.Attrs["consumer"])
 		assert.NotEmpty(t, got.Attrs["entry_id"])
 		require.Error(t, got.Err)
+
+		// A key colliding with one of DecodeError's own fields is dropped by a
+		// consumer rather than allowed to shadow it, so it would vanish between
+		// here and whatever reads it. Fail at the source instead.
+		for key := range got.Attrs {
+			assert.False(t, wire.IsReservedAttr(key),
+				"Attrs key %q collides with a fixed DecodeError field and would be dropped", key)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("on_decode_error hook was not invoked")
 	}

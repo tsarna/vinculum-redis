@@ -203,12 +203,59 @@ func TestSubscriberDecodeErrorInvokesHook(t *testing.T) {
 		assert.Equal(t, "alerts", got.Topic)
 		assert.Equal(t, "alerts", got.Attrs["channel"])
 		require.Error(t, got.Err)
+		assertNoReservedAttrs(t, got)
 	case <-time.After(2 * time.Second):
 		t.Fatal("on_decode_error hook was not invoked")
 	}
 
 	// The hook observes; it does not suppress.
 	assert.Empty(t, rec.wait(t, 0))
+}
+
+// TestSubscriberPatternDecodeErrorCarriesMatchedPattern covers the conditional
+// attribute: on a pattern subscription the channel alone doesn't say which
+// subscription matched, so the hook gets both.
+func TestSubscriberPatternDecodeErrorCarriesMatchedPattern(t *testing.T) {
+	_, c := newSubClient(t)
+	rec := &recordingSub{}
+	hookCh := make(chan wire.DecodeError, 1)
+
+	sub := pubsub.NewSubscriber("main", c).
+		WithSubscription(pubsub.ChannelSubscription{Channel: "devices.*"}).
+		WithTarget(rec).
+		WithWireFormat(wire.JSON).
+		WithDecodeErrorHook(func(_ context.Context, e wire.DecodeError) {
+			hookCh <- e
+		}).
+		Build()
+
+	require.NoError(t, sub.Start(context.Background()))
+	defer sub.Stop()
+
+	require.NoError(t, c.Publish(context.Background(), "devices.abc", "not json {{").Err())
+
+	select {
+	case got := <-hookCh:
+		assert.Equal(t, "devices.abc", got.Attrs["channel"])
+		assert.Equal(t, "devices.*", got.Attrs["matched_pattern"])
+		require.Error(t, got.Err)
+		assertNoReservedAttrs(t, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("on_decode_error hook was not invoked")
+	}
+}
+
+// assertNoReservedAttrs fails on an Attrs key that collides with one of
+// DecodeError's own fields. A consumer drops such a key rather than let it
+// shadow Topic or Raw, so the value would vanish between here and whatever
+// reads it — as it did when vinculum-mqtt shipped Attrs["topic"]. Catching it
+// at the source is the only place the name can still be changed.
+func assertNoReservedAttrs(t *testing.T, e wire.DecodeError) {
+	t.Helper()
+	for key := range e.Attrs {
+		assert.False(t, wire.IsReservedAttr(key),
+			"Attrs key %q collides with a fixed DecodeError field and would be dropped", key)
+	}
 }
 
 func TestSubscriberAutoWireFormatToleratesNonJSON(t *testing.T) {

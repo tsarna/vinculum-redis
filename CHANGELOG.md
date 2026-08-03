@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Requires `github.com/tsarna/vinculum-wire` v0.5.0, for `wire.IsReservedAttr`. Both
+  receivers' decode-error tests now check every `Attrs` key against it. A key that
+  collides with one of `DecodeError`'s own fields is dropped by a consumer rather than
+  allowed to shadow the fixed field, so its value is silently lost downstream — which is
+  what happened to `vinculum-mqtt`'s `Attrs["topic"]`. This module's keys (`channel`,
+  `matched_pattern`, `stream`, `entry_id`, `group`, `consumer`) are and always were
+  clean; the check is what keeps a future rename from quietly breaking one.
+
+### Added
+
+- Test coverage for a decode failure on a **pattern** subscription, which is the only
+  path that populates `Attrs["matched_pattern"]`. The conditional attribute was
+  previously never exercised.
+
 ## v0.4.0 (2026-07-20)
 
 ### Changed
