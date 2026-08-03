@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## v0.5.0 (2026-08-03)
+
 ### Changed
 
 - Requires `github.com/tsarna/vinculum-wire` v0.5.0, for `wire.IsReservedAttr`. Both
