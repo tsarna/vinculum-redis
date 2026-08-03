@@ -18,6 +18,21 @@
   path that populates `Attrs["matched_pattern"]`. The conditional attribute was
   previously never exercised.
 
+- A regression test subscribing to a **short channel name**, covering a go-redis bug that
+  `Start()` had no defence against. v9.21.0 changed `PeekPushNotificationName` from a
+  peek clamped to what was already buffered into an unconditional `bufio` `Peek(36)`. A
+  subscribe confirmation is 29 bytes plus the channel name, so a channel of six
+  characters or fewer (or a pattern of four or fewer) produces a frame with no 36th byte;
+  nothing more arrives until someone publishes, and the read carries no deadline, so
+  `Start()` blocked forever. Fixed upstream in v9.22.0
+  ([redis/go-redis#3935](https://github.com/redis/go-redis/issues/3935)), which this
+  module now requires.
+
+  Nothing here caught it: the other subscriber tests use longer names, or subscribe to an
+  exact channel and a pattern at once, which pipelines two confirmations into the buffer
+  and clears 36 bytes between them. The new test uses a single short name, so the
+  narrow window between v9.21.0 and v9.22.0 would have failed CI.
+
 ## v0.4.0 (2026-07-20)
 
 ### Changed

@@ -82,6 +82,40 @@ func TestSubscriberExactChannel(t *testing.T) {
 	assert.Equal(t, map[string]any{"level": "high"}, evs[0].msg)
 }
 
+// TestSubscriberStartsOnAShortChannelName covers a go-redis regression.
+//
+// v9.21.0 changed proto.Reader.PeekPushNotificationName from a peek clamped to
+// what was already buffered into an unconditional bufio Peek(36). A subscribe
+// confirmation is `>3\r\n$9\r\nsubscribe\r\n$N\r\n<channel>\r\n:1\r\n` — 29 bytes plus
+// the channel name — so a channel of six characters or fewer produces a frame
+// with no 36th byte. Nothing more arrives until someone publishes, and the read
+// carries no deadline, so the Receive() in Start() blocked forever. Fixed in
+// v9.22.0; see https://github.com/redis/go-redis/issues/3935.
+//
+// The other tests here do not catch it: they subscribe to longer names, or to
+// an exact channel and a pattern at once, which pipelines two confirmations
+// into the buffer and clears 36 bytes between them.
+func TestSubscriberStartsOnAShortChannelName(t *testing.T) {
+	_, c := newSubClient(t)
+
+	sub := pubsub.NewSubscriber("main", c).
+		WithSubscription(pubsub.ChannelSubscription{Channel: "up"}).
+		WithTarget(&recordingSub{}).
+		Build()
+
+	done := make(chan error, 1)
+	go func() { done <- sub.Start(context.Background()) }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		sub.Stop()
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start() hung on a short channel name; " +
+			"check which version of github.com/redis/go-redis/v9 is in go.mod")
+	}
+}
+
 func TestSubscriberPattern(t *testing.T) {
 	_, c := newSubClient(t)
 	rec := &recordingSub{}
