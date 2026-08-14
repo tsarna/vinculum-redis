@@ -6,7 +6,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tsarna/vinculum-bus v0.15.1
+	github.com/tsarna/vinculum-bus v0.16.0
 	github.com/tsarna/vinculum-wire v0.5.0
 	github.com/zclconf/go-cty v1.19.0
 	go.opentelemetry.io/otel v1.45.0
