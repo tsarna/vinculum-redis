@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## v0.6.0 (2026-08-28)
+
 ### Added
 
 - `RedisStreamConsumer` now exposes the entry ID to every delivery as the field
