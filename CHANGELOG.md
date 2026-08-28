@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- `RedisStreamConsumer` now exposes the entry ID to every delivery as the field
+  `$entry_id`. Manual acknowledgement (`auto_ack = false` + `Ack(ctx, id)`) needs
+  that ID, and nothing in the delivery path carried it: the target sees the topic,
+  the payload, and the entry's own fields, none of which is the ID. This matches
+  how `vinculum-sqs` hands a receiver's `$receipt_handle` to a manual delete, and
+  uses the same `$` prefix reserved for system-generated names. It is added
+  regardless of `fields_mode`, which governs the entry's own fields, so the
+  delivered map is never empty (it was previously nil when the entry carried no
+  fields).
+
 ## v0.5.0 (2026-08-03)
 
 ### Changed

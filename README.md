@@ -97,6 +97,8 @@ to a `bus.Subscriber`, and acknowledges them.
   `require_existing`, `create_from_start` (replay history from ID `0`).
 - `auto_ack = true` (default) issues `XACK` after successful delivery;
   `auto_ack = false` leaves entries in the PEL for manual `Ack(ctx, id)`.
+- Every delivered `fields` map carries the entry ID as `$entry_id` — the
+  ID `Ack` takes, which is otherwise not reachable from a delivery.
 - Reclaim-on-Start: walks the group's pending list and `XCLAIM`s entries
   idle past `reclaim_min_idle`, then runs them through the delivery path
   (`XREADGROUP >` will not redeliver already-claimed entries).

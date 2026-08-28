@@ -443,7 +443,8 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 }
 
 // parseEntry extracts payload + fields from a stream entry using the
-// symmetric payload_field / topic_field / fields_mode configuration.
+// symmetric payload_field / topic_field / fields_mode configuration. The
+// returned fields map always carries the entry's ID as `$entry_id`.
 func (c *RedisStreamConsumer) parseEntry(ctx context.Context, entry goredis.XMessage) (any, map[string]string, error) {
 	var payload any
 	fields := make(map[string]string)
@@ -516,9 +517,14 @@ func (c *RedisStreamConsumer) parseEntry(ctx context.Context, entry goredis.XMes
 		}
 	}
 
-	if len(fields) == 0 {
-		fields = nil
-	}
+	// The entry ID is not one of the entry's own fields, but manual
+	// acknowledgement needs it and the delivery path has nowhere else to put
+	// it. Expose it under the `$` prefix reserved for system-generated names,
+	// as the SQS receiver does with `$receipt_handle`. It is added regardless
+	// of fields_mode — that setting governs the entry's own fields — so the
+	// map is never empty.
+	fields["$entry_id"] = entry.ID
+
 	return payload, fields, nil
 }
 

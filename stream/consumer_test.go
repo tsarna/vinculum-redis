@@ -308,6 +308,48 @@ func TestConsumerAutoAckFalseLeavesPending(t *testing.T) {
 	assert.EqualValues(t, 1, pending.Count)
 }
 
+// TestConsumerExposesEntryIDField covers the one value manual acknowledgement
+// needs and the entry's own fields cannot carry: the delivered fields map
+// names the entry ID as `$entry_id`, and acking with it clears the entry from
+// the pending list.
+func TestConsumerExposesEntryIDField(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	recv := &recorder{}
+	cons := stream.NewConsumer("in", c).
+		WithStream("events").
+		WithGroup("g").
+		WithConsumerName("c").
+		WithBlockTimeout(100 * time.Millisecond).
+		WithAutoAck(false).
+		WithTarget(recv).
+		Build()
+	require.NoError(t, cons.Start(context.Background()))
+	defer cons.Stop()
+
+	p := stream.NewProducer("out", c).WithStreamFunc(func(string, any, map[string]string) (string, error) {
+		return "events", nil
+	}).Build()
+	// No fields on the way in: the entry ID must show up even when the entry
+	// carries no metadata of its own.
+	require.NoError(t, p.OnEvent(context.Background(), "x", "hi", nil))
+
+	evs := recv.wait(t, 1)
+	require.Len(t, evs, 1)
+
+	entries, err := c.XRange(context.Background(), "events", "-", "+").Result()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, entries[0].ID, evs[0].fields["$entry_id"])
+
+	require.NoError(t, cons.Ack(context.Background(), evs[0].fields["$entry_id"]))
+	pending, err := c.XPending(context.Background(), "events", "g").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, pending.Count, "acking with $entry_id should clear the entry")
+}
+
 // ── strict decode ─────────────────────────────────────────────────────────────
 
 func TestConsumerDecodeErrorIsFatalAndLeavesPending(t *testing.T) {
