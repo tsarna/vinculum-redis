@@ -95,10 +95,28 @@ to a `bus.Subscriber`, and acknowledges them.
 
 - Consumer group policies: `create_if_missing` (default, `MKSTREAM`),
   `require_existing`, `create_from_start` (replay history from ID `0`).
-- `auto_ack = true` (default) issues `XACK` after successful delivery;
-  `auto_ack = false` leaves entries in the PEL for manual `Ack(ctx, id)`.
-- Every delivered `fields` map carries the entry ID as `$entry_id` — the
-  ID `Ack` takes, which is otherwise not reachable from a delivery.
+- Every delivery carries a `bus.Settler` on its context, so anything
+  downstream can `Ack`, `Nack`, or `Keepalive` the entry without knowing it
+  came from Redis:
+
+  ```go
+  if s := bus.SettlerFromContext(ctx); s != nil {
+      settled, err := s.Ack(ctx)
+  }
+  ```
+
+  `Ack` is `XACK`; `Nack` sends nothing, since an entry is not-acknowledged by
+  staying in the PEL for `reclaim_min_idle` and `dead_letter_after` to act on;
+  `Keepalive` re-claims the entry for this same consumer, resetting its idle
+  time, which is the lease Redis Streams has.
+- `auto_ack = true` (default) settles through that same settler after
+  successful delivery, so a subscriber that acknowledged the entry itself is
+  not acknowledged twice. `auto_ack = false` leaves it entirely to the
+  subscriber.
+- Every delivered `fields` map carries the entry ID as `$entry_id`. It is not
+  a settle token — the settler needs no help — but it identifies the entry for
+  logging, correlation, and deduplication, which `XPENDING` and every Redis
+  console show too.
 - Reclaim-on-Start: walks the group's pending list and `XCLAIM`s entries
   idle past `reclaim_min_idle`, then runs them through the delivery path
   (`XREADGROUP >` will not redeliver already-claimed entries).
@@ -164,10 +182,10 @@ client "redis_stream" "rs" {
 }
 ```
 
-The full block surface — cluster and sentinel modes, TLS, manual ack via
-`redis_ack()`, and the `redis_kv` key-value client (which lives in the
-vinculum main repo) — is documented alongside the other vinculum client
-blocks.
+The full block surface — cluster and sentinel modes, TLS, manual
+acknowledgement via `inbound::ack()`, and the `redis_kv` key-value client
+(which lives in the vinculum main repo) — is documented alongside the other
+vinculum client blocks.
 
 ## License
 

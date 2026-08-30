@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+## v0.7.0 (2026-08-30)
+
+### Added
+
+- **Every delivery carries a settler.** Acknowledgement is a property of the
+  delivery, not of the payload and not of the subscriber that handles it, and
+  `fields` cannot carry it — the bus rewrites those per subscription. So the
+  consumer now puts a `bus.Settler` (vinculum-bus v0.18.0) on the context it
+  delivers with, and anything downstream — past transforms, an async queue, and
+  any number of bus hops — can settle the entry without knowing it came from
+  Redis:
+
+  ```go
+  if s := bus.SettlerFromContext(ctx); s != nil {
+      settled, err := s.Ack(ctx)
+  }
+  ```
+
+  `Ack` is `XACK`. `Nack` sends nothing, because a Redis Streams entry is
+  not-acknowledged by remaining in the pending entries list, where the
+  consumer's own `reclaim_min_idle` and `dead_letter_after` decide what becomes
+  of it — the receiver's configured policy, deliberately not the caller's
+  choice; the reason is logged. `Keepalive` re-claims the entry for this same
+  consumer, resetting its idle time, which is the lease Redis Streams has, and
+  reports what `XCLAIM` actually claimed, so an entry already acknowledged is an
+  honest "nothing extended" rather than an error.
+
+### Changed
+
+- **`auto_ack = true` settles through that same settler**, so a subscriber that
+  acknowledged the entry itself is not acknowledged twice. Automatic
+  acknowledgement is now one policy over one mechanism rather than a second path
+  to the broker. Behaviour is otherwise unchanged: the entry is still acked
+  after delivery returns without error, and only then.
+- `$entry_id` is no longer described as the value manual acknowledgement takes,
+  because acknowledgement no longer takes anything. The field stays: a Redis
+  entry ID identifies the entry independently of acknowledgement — time-ordered,
+  unique, what `XPENDING` and every operator's console show — and is worth
+  having for logging, correlation, and deduplication.
+- `Ack(ctx, id)` remains, for a caller holding an entry ID it obtained some
+  other way, and now shares its single `XACK` implementation with the settler.
+
 ## v0.6.0 (2026-08-28)
 
 ### Added
