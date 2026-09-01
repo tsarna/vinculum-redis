@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`auto_ack` acknowledges when the work finishes, not when delivery
+  returns.** The two are the same thing only while delivery is synchronous. Put
+  an async queue, a bus hop, or a state machine downstream and delivery returns
+  the moment the entry is *enqueued* — so the entry was XACKed before anything
+  had handled it, and a handler that then failed had nothing left to redeliver.
+
+  The consumer now marks its settler as framework-settled and lets whatever
+  finishes the work settle it, however many hops away that happens. This makes
+  `queue_size` alongside automatic acknowledgement correct, where before it was
+  a way to lose entries.
+
+  A failed handler nacks, which on Redis Streams means leaving the entry in the
+  pending entries list for `reclaim_min_idle` to hand to another consumer —
+  what used to happen implicitly, now with a log line saying why.
+
+  `WithAutoAck` keeps its name and its meaning as a configuration: "vinculum
+  acknowledges for you". What changed is when.
+
 ## v0.7.0 (2026-08-30)
 
 ### Added

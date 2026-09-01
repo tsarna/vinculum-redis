@@ -78,8 +78,20 @@ func (o *entrySettleOps) Keepalive(ctx context.Context) (bool, error) {
 func (o *entrySettleOps) Valid() (bool, string) { return true, "" }
 
 // newSettler returns the settler for one delivery of entry id on stream.
+//
+// Under auto_ack the settler is marked as settled by the framework, which is
+// the same boolean this consumer has always carried and a different thing to do
+// with it. It used to mean "acknowledge once delivery returns", which is exact
+// only while delivery is synchronous — a queue or a bus hop downstream returns
+// as soon as the message is enqueued. Now it means "whoever finishes the work
+// settles this", and the acknowledgement follows the work however many hops
+// away it happens.
 func (c *RedisStreamConsumer) newSettler(stream, id string) bus.Settler {
-	return bus.NewSettler(&entrySettleOps{consumer: c, stream: stream, id: id})
+	ops := &entrySettleOps{consumer: c, stream: stream, id: id}
+	if c.autoAck {
+		return bus.NewSettler(ops, bus.AutoSettle())
+	}
+	return bus.NewSettler(ops)
 }
 
 // ackEntry is the one XACK in this package: the manual path, the automatic

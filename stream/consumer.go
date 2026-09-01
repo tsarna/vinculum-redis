@@ -211,21 +211,11 @@ func (c *RedisStreamConsumer) reclaimOwn(ctx context.Context) error {
 	// them on Start without waiting for a new XADD.
 	for _, entry := range claimed {
 		c.metrics.AddPending(ctx, c.streamName, c.group, 1)
-		settler, err := c.deliver(ctx, c.streamName, entry)
-		if err != nil {
+		if err := c.deliver(ctx, c.streamName, entry); err != nil {
 			c.logger.Warn("redis_stream consumer: reclaim deliver",
 				zap.String("consumer", c.name),
 				zap.String("id", entry.ID),
 				zap.Error(err))
-			continue
-		}
-		if c.autoAck {
-			if _, err := settler.Ack(ctx); err != nil {
-				c.logger.Warn("redis_stream consumer: reclaim xack",
-					zap.String("consumer", c.name),
-					zap.String("id", entry.ID),
-					zap.Error(err))
-			}
 		}
 	}
 	return nil
@@ -281,8 +271,10 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 			for _, entry := range s.Messages {
 				// Entry is now in this consumer's PEL until ACK or DLQ.
 				c.metrics.AddPending(ctx, s.Stream, c.group, 1)
-				settler, err := c.deliver(ctx, s.Stream, entry)
-				if err != nil {
+				// deliver settles on what the target did; what is left here is
+				// the retry budget, which is this loop's business rather than
+				// one delivery's.
+				if err := c.deliver(ctx, s.Stream, entry); err != nil {
 					c.logger.Warn("redis_stream consumer: deliver",
 						zap.String("consumer", c.name),
 						zap.String("stream", s.Stream),
@@ -292,30 +284,12 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 					// configured retry budget and should DLQ instead of
 					// leaving the entry pending for another attempt.
 					if c.deadLetterStream != "" && c.deadLetterAfter > 0 {
-						if moved, dlErr := c.maybeDeadLetter(ctx, s.Stream, entry); dlErr != nil {
+						if _, dlErr := c.maybeDeadLetter(ctx, s.Stream, entry); dlErr != nil {
 							c.logger.Warn("redis_stream consumer: dead-letter",
 								zap.String("consumer", c.name),
 								zap.String("id", entry.ID),
 								zap.Error(dlErr))
-						} else if moved {
-							continue
 						}
-					}
-					// auto_ack only on successful delivery.
-					continue
-				}
-				// Automatic acknowledgement goes through the same settler the
-				// action would have used, so a configuration that acknowledged
-				// the entry itself is not acknowledged twice, and "vinculum
-				// acks for you" is one policy over one mechanism rather than a
-				// second path to the broker.
-				if c.autoAck {
-					if _, err := settler.Ack(ctx); err != nil {
-						c.logger.Warn("redis_stream consumer: xack",
-							zap.String("consumer", c.name),
-							zap.String("stream", s.Stream),
-							zap.String("id", entry.ID),
-							zap.Error(err))
 					}
 				}
 			}
@@ -366,16 +340,23 @@ func (c *RedisStreamConsumer) maybeDeadLetter(ctx context.Context, streamName st
 	return true, nil
 }
 
-// deliver hands one entry to the target and returns the settler for it, so the
-// caller can acknowledge through the same path a subscriber would have. The
-// settler is returned even when delivery fails: the entry is still outstanding,
-// and a dead-letter decision is still a settle.
-func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, entry goredis.XMessage) (bus.Settler, error) {
+// deliver hands one entry to the target and settles it on what the target did.
+//
+// The settle is here rather than in the callers because this is the only place
+// that knows the target's outcome. A caller acknowledging on deliver's return
+// would be acknowledging the *enqueue* whenever anything downstream defers —
+// a queue_size queue, a bus hop, a state machine — which is the entry being
+// reported handled before anything handled it.
+//
+// Failures before the target is reached are not settled here. The entry is
+// still outstanding and the caller's dead-letter budget is what decides its
+// fate, which is a policy this function has no business preempting.
+func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, entry goredis.XMessage) error {
 	settler := c.newSettler(streamName, entry.ID)
 
 	msg, fields, err := c.parseEntry(ctx, entry)
 	if err != nil {
-		return settler, err
+		return err
 	}
 
 	// Extract W3C trace context from the entry's traceparent/tracestate
@@ -438,7 +419,7 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			c.metrics.RecordError(ctx, "process", "vinculum_topic")
-			return settler, fmt.Errorf("vinculum_topic: %w", err)
+			return fmt.Errorf("vinculum_topic: %w", err)
 		}
 		if out != "" {
 			topic = out
@@ -448,14 +429,21 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 	start := time.Now()
 	err = c.target.OnEvent(ctx, topic, msg, fields)
 	c.metrics.RecordProcessDuration(ctx, streamName, c.group, time.Since(start).Seconds())
+
+	// The settle point. Under auto_ack this acknowledges a target that handled
+	// the entry and leaves one that only queued it to settle at its own
+	// completion; under manual it does nothing but report a failure, because
+	// the configuration asked for the decision.
+	bus.SettleOnReturn(ctx, c.target, err)
+
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		c.metrics.RecordError(ctx, "process", "deliver")
-		return settler, err
+		return err
 	}
 	c.metrics.RecordConsumed(ctx, streamName, c.group, c.consumerName)
-	return settler, nil
+	return nil
 }
 
 // parseEntry extracts payload + fields from a stream entry using the
