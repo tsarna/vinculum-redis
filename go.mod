@@ -6,7 +6,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/stretchr/testify v1.12.1
-	github.com/tsarna/vinculum-bus v0.18.0
+	github.com/tsarna/vinculum-bus v0.19.0
 	github.com/tsarna/vinculum-wire v0.5.0
 	github.com/zclconf/go-cty v1.19.0
 	go.opentelemetry.io/otel v1.46.0
@@ -24,6 +24,7 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/tsarna/go-structdiff v0.2.1 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect

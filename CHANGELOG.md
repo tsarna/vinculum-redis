@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## v0.8.0 (2026-09-01)
+
 ### Changed
 
 - **`auto_ack` acknowledges when the work finishes, not when delivery
