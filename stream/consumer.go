@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -71,17 +72,78 @@ type RedisStreamConsumer struct {
 	metrics        *streamMetrics
 	tracerProvider trace.TracerProvider
 
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	running sync.WaitGroup
+	// Two cancels, because stopping is two things and a graceful shutdown wants
+	// them apart. stopRead ends the XREADGROUP loop and nothing else; stopWork
+	// cancels the context every delivery and every settle rides on, and so is
+	// the one that ends the consumer. stopRead's context is derived from
+	// stopWork's, so cancelling work ends reading too.
+	mu       sync.Mutex
+	stopRead context.CancelFunc
+	stopWork context.CancelFunc
+	running  sync.WaitGroup
+
+	// unsettled counts deliveries handed out and not yet acknowledged, nacked,
+	// or abandoned. See Unsettled.
+	unsettled atomic.Int64
+
+	// stillDelivering is the channel a timed-out Drain was waiting on, closed
+	// when the loop finally finishes. Nil until the first drain, and set by
+	// every drain rather than only by one that gives up — what makes it answer
+	// "no" is the channel being closed, not the field being absent.
+	//
+	// A channel rather than a flag because the question is asked a phase later
+	// and the answer moves in between: teardown runs a whole quiesce between
+	// Drain and Stop, so a delivery that overran the drain's deadline by a
+	// moment has very likely finished by the time Stop looks. A flag would say
+	// otherwise and put an error in the log of a shutdown where nothing went
+	// wrong. See stillRunning.
+	stillDelivering atomic.Pointer[chan struct{}]
 }
+
+// stillRunning reports whether a delivery a drain gave up on is running *now*,
+// rather than whether one ever was.
+func (c *RedisStreamConsumer) stillRunning() bool {
+	ch := c.stillDelivering.Load()
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-*ch:
+		return false
+	default:
+		return true
+	}
+}
+
+// Unsettled reports how many deliveries this consumer has handed out that
+// nothing has settled yet.
+//
+// It is not the length of the pending entries list. An entry left pending by a
+// nack, or by a delivery that failed before reaching the target, is Redis's
+// business — reclaim_min_idle and dead_letter_after decide what becomes of it —
+// and nothing in this process is going to acknowledge it. What this counts is
+// the narrower thing a shutdown can usefully wait for: settles that are still
+// coming.
+func (c *RedisStreamConsumer) Unsettled() int { return int(c.unsettled.Load()) }
 
 // Start creates the group per policy, then launches the poll loop.
 func (c *RedisStreamConsumer) Start(ctx context.Context) error {
 	c.mu.Lock()
-	if c.cancel != nil {
+	if c.stopWork != nil {
 		c.mu.Unlock()
 		return fmt.Errorf("redis_stream consumer %q: already started", c.name)
+	}
+
+	// The loop from the last cycle still owns the WaitGroup. A Stop that gave up
+	// on a delivery returns without waiting, so that goroutine never reached its
+	// Done — and starting another over the top of it would leave the counter at
+	// two, with this cycle's Stop blocking forever on the abandoned half of it.
+	// That is the unbounded wait the bound above exists to remove, one cycle
+	// later and with nothing left to report it. Checked before the clear below,
+	// which would otherwise erase the evidence.
+	if c.stillRunning() {
+		c.mu.Unlock()
+		return fmt.Errorf("redis_stream consumer %q: a previous delivery is still running", c.name)
 	}
 
 	if err := c.ensureGroup(ctx); err != nil {
@@ -99,13 +161,27 @@ func (c *RedisStreamConsumer) Start(ctx context.Context) error {
 		}
 	}
 
-	runCtx, cancel := context.WithCancel(context.Background())
-	c.cancel = cancel
+	workCtx, stopWork := context.WithCancel(context.Background())
+	readCtx, stopRead := context.WithCancel(workCtx)
+	c.stopWork = stopWork
+	c.stopRead = stopRead
+
+	// stillDelivering is deliberately left as it is. The guard above has already
+	// established that it is nil or closed, and a closed channel answers
+	// stillRunning the same way nil does — until this cycle's own Drain
+	// replaces it. Clearing it here would look like the load-bearing step and
+	// would not be one.
+
+	// Added under the lock, because Drain takes the same lock before it waits.
+	// Outside it there is a window in which a drain landing between the unlock
+	// and the Add finds the counter at zero, returns immediately, and reports a
+	// clean drain of a loop that had not started — and the Add then races the
+	// Wait, which is the one thing a WaitGroup forbids.
+	c.running.Add(1)
 	c.mu.Unlock()
 
-	c.running.Add(1)
 	c.metrics.AddConnected(ctx, c.streamName, c.group, 1)
-	go c.runLoop(runCtx)
+	go c.runLoop(readCtx, workCtx)
 	return nil
 }
 
@@ -127,18 +203,114 @@ func (c *RedisStreamConsumer) Stream() string { return c.streamName }
 // Group returns the consumer group name.
 func (c *RedisStreamConsumer) Group() string { return c.group }
 
-func (c *RedisStreamConsumer) Stop() error {
+// Drain stops reading new entries and waits for the loop to finish the batch it
+// is holding. It leaves everything else alone: the Redis client stays open, the
+// settlers already handed out stay valid, and a delivery still travelling
+// through a queue downstream settles normally when it lands.
+//
+// That is the whole difference between draining and stopping, and it is what
+// lets a shutdown stop consuming first and disconnect last. Between the two, a
+// process is finishing work it has already accepted and taking on none.
+//
+// Bounded by ctx, which the caller sizes: what is being waited for is one
+// batch's worth of delivery, and delivery runs user-supplied work.
+//
+// Safe to call before Start, after Stop, or twice — though a second call after
+// one that timed out reports the timeout again rather than a clean drain, since
+// the delivery it gave up on is still running.
+func (c *RedisStreamConsumer) Drain(ctx context.Context) error {
 	c.mu.Lock()
-	cancel := c.cancel
-	c.cancel = nil
-	c.mu.Unlock()
-	if cancel == nil {
+	stopRead := c.stopRead
+	if stopRead == nil {
+		c.mu.Unlock()
+		if c.stillRunning() {
+			return fmt.Errorf("redis_stream consumer %q: still delivering", c.name)
+		}
 		return nil
 	}
-	cancel()
+	c.stopRead = nil
+	stopRead()
+
+	done := make(chan struct{})
+	go func() {
+		c.running.Wait()
+		close(done)
+	}()
+
+	// Published before the wait, not only when the wait gives up: the waiter
+	// outlives this call either way, and while it is open it is the honest
+	// answer to "is the loop still delivering" — which is what a later phase
+	// asks.
+	//
+	// Published under the same lock that cleared stopRead, because the two
+	// together are what a concurrent second Drain reads. Between them it would
+	// see the field already taken and no waiter yet, and report a clean drain
+	// that has not happened — which is the whole defect this is here to
+	// prevent, surviving in the gap. Nothing under this lock does I/O.
+	c.stillDelivering.Store(&done)
+	c.mu.Unlock()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("redis_stream consumer %q: drain: %w", c.name, ctx.Err())
+	}
+}
+
+// Stop ends the consumer: reading stops if it has not already, and the context
+// every in-flight delivery and every outstanding settle rides on is cancelled.
+// An acknowledgement arriving after this has nowhere to go, which is why a
+// graceful shutdown drains first and gets here only once the pipeline is empty.
+//
+// It waits for the loop, so a delivery still running finishes and settles
+// normally — with one exception. A Drain that timed out has already given that
+// delivery a bounded chance to finish, and it did not take it; waiting here
+// would hand the same expression a second wait with no bound at all, and this
+// time nothing would interrupt it. So Stop cancels and reports rather than
+// blocking, because the one thing a stuck action must never be able to do is
+// stop the process from exiting.
+//
+// Whether it is *still* running is checked here rather than remembered from the
+// drain. A whole phase separates the two, and a delivery that overran the
+// drain's deadline by a moment has usually finished by now — reporting one that
+// has not, when it has, is an error in the log of a shutdown that went fine.
+//
+// Repeated calls repeat the answer, as Drain's do, so a caller that stops twice
+// is not told the second time that everything was well.
+//
+// A consumer stopped this way cannot be started again until that delivery
+// finishes, because the goroutine still owns the loop's WaitGroup. Start says
+// so rather than queueing up a wait that would never end.
+func (c *RedisStreamConsumer) Stop() error {
+	c.mu.Lock()
+	stopWork := c.stopWork
+	c.stopRead, c.stopWork = nil, nil
+	c.mu.Unlock()
+
+	if stopWork == nil {
+		return c.stoppedWithDeliveryRunning()
+	}
+	// Cancelling work cancels reading with it: the read context is derived
+	// from this one, so a Stop that was not preceded by a Drain still ends
+	// the loop.
+	stopWork()
+
+	if err := c.stoppedWithDeliveryRunning(); err != nil {
+		c.metrics.AddConnected(context.Background(), c.streamName, c.group, -1)
+		return err
+	}
+
 	c.running.Wait()
 	c.metrics.AddConnected(context.Background(), c.streamName, c.group, -1)
 	return nil
+}
+
+func (c *RedisStreamConsumer) stoppedWithDeliveryRunning() error {
+	if !c.stillRunning() {
+		return nil
+	}
+	return fmt.Errorf("redis_stream consumer %q: stopped with a delivery still running", c.name)
 }
 
 func (c *RedisStreamConsumer) ensureGroup(ctx context.Context) error {
@@ -227,22 +399,33 @@ func isBusyGroupErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
 }
 
-func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
+// runLoop reads entries and delivers them until reading is stopped.
+//
+// The two contexts are the same lifetime until a drain separates them. readCtx
+// bounds the XREADGROUP call and decides when the loop exits; workCtx is what
+// every delivery, settle and dead-letter runs on, and outlives readCtx by the
+// length of the shutdown. Passing readCtx to a delivery would mean draining
+// cancelled the work it was waiting for, and cancelled the acknowledgement it
+// was waiting for the work to produce.
+//
+// The batch in hand is finished either way: the exit check is at the top of the
+// loop, so a drain that lands mid-batch delivers the rest of it and then stops.
+func (c *RedisStreamConsumer) runLoop(readCtx, workCtx context.Context) {
 	defer c.running.Done()
 	backoff := time.Second
 	for {
-		if ctx.Err() != nil {
+		if readCtx.Err() != nil {
 			return
 		}
 		start := time.Now()
-		streams, err := c.client.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		streams, err := c.client.XReadGroup(readCtx, &goredis.XReadGroupArgs{
 			Group:    c.group,
 			Consumer: c.consumerName,
 			Streams:  []string{c.streamName, ">"},
 			Count:    c.batchSize,
 			Block:    c.blockTimeout,
 		}).Result()
-		c.metrics.RecordReceiveDuration(ctx, c.streamName, time.Since(start).Seconds())
+		c.metrics.RecordReceiveDuration(workCtx, c.streamName, time.Since(start).Seconds())
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -256,7 +439,7 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 				zap.String("consumer", c.name),
 				zap.Error(err))
 			select {
-			case <-ctx.Done():
+			case <-readCtx.Done():
 				return
 			case <-time.After(backoff):
 			}
@@ -270,11 +453,11 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 		for _, s := range streams {
 			for _, entry := range s.Messages {
 				// Entry is now in this consumer's PEL until ACK or DLQ.
-				c.metrics.AddPending(ctx, s.Stream, c.group, 1)
+				c.metrics.AddPending(workCtx, s.Stream, c.group, 1)
 				// deliver settles on what the target did; what is left here is
 				// the retry budget, which is this loop's business rather than
 				// one delivery's.
-				if err := c.deliver(ctx, s.Stream, entry); err != nil {
+				if err := c.deliver(workCtx, s.Stream, entry); err != nil {
 					c.logger.Warn("redis_stream consumer: deliver",
 						zap.String("consumer", c.name),
 						zap.String("stream", s.Stream),
@@ -284,7 +467,7 @@ func (c *RedisStreamConsumer) runLoop(ctx context.Context) {
 					// configured retry budget and should DLQ instead of
 					// leaving the entry pending for another attempt.
 					if c.deadLetterStream != "" && c.deadLetterAfter > 0 {
-						if _, dlErr := c.maybeDeadLetter(ctx, s.Stream, entry); dlErr != nil {
+						if _, dlErr := c.maybeDeadLetter(workCtx, s.Stream, entry); dlErr != nil {
 							c.logger.Warn("redis_stream consumer: dead-letter",
 								zap.String("consumer", c.name),
 								zap.String("id", entry.ID),
@@ -352,10 +535,14 @@ func (c *RedisStreamConsumer) maybeDeadLetter(ctx context.Context, streamName st
 // still outstanding and the caller's dead-letter budget is what decides its
 // fate, which is a policy this function has no business preempting.
 func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, entry goredis.XMessage) error {
-	settler := c.newSettler(streamName, entry.ID)
+	settler, ops := c.newSettler(streamName, entry.ID)
 
 	msg, fields, err := c.parseEntry(ctx, entry)
 	if err != nil {
+		// Released, not settled. The entry stays pending — that is the policy
+		// this function does not preempt — but no acknowledgement is ever
+		// coming for it, so a shutdown has nothing to wait for.
+		ops.release()
 		return err
 	}
 
@@ -419,6 +606,7 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			c.metrics.RecordError(ctx, "process", "vinculum_topic")
+			ops.release()
 			return fmt.Errorf("vinculum_topic: %w", err)
 		}
 		if out != "" {
@@ -435,6 +623,15 @@ func (c *RedisStreamConsumer) deliver(ctx context.Context, streamName string, en
 	// completion; under manual it does nothing but report a failure, because
 	// the configuration asked for the decision.
 	bus.SettleOnReturn(ctx, c.target, err)
+
+	// An observing target settles nothing and defers to nobody — it saw the
+	// entry go past. SettleOnReturn returns without acting, so no settle is
+	// coming from anywhere and this delivery has to be released by hand or the
+	// count never comes back down. It is the third of the three paths through
+	// here that reach no settler; the other two are the failures above.
+	if bus.DispositionOf(c.target) == bus.Observed {
+		ops.release()
+	}
 
 	if err != nil {
 		span.RecordError(err)

@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`Drain`, so a consumer can stop reading without stopping.** Stopping used
+  to be one action: cancel everything and close. That is the wrong shape for a
+  graceful shutdown, where a process wants to stop *accepting* entries long
+  before it stops being able to acknowledge them — because the acknowledgement
+  travels over the same connection the stop closes.
+
+  `Drain(ctx)` ends the `XREADGROUP` loop and waits for the batch in hand to
+  finish delivering. Everything else is left alone: the client stays open,
+  settlers already handed out stay valid, and an entry still travelling through
+  a queue downstream acknowledges normally when it lands. `Stop` then closes up
+  afterwards, with nothing left owed.
+
+  The wait is bounded by the caller's context, because what it waits for is
+  user-supplied work.
+
+- **`Unsettled`, the count of deliveries nothing has settled yet.** Not the
+  length of the pending entries list: an entry left pending by a nack is
+  Redis's business, and nothing in this process is going to acknowledge it.
+  This is the narrower number a shutdown can usefully wait for — acknowledgements
+  that are still coming.
+
+### Changed
+
+- **`Stop` no longer waits without a bound after a drain that timed out.** The
+  drain has already given that delivery a bounded chance to finish and it did
+  not take it; waiting again, with no bound and nothing to interrupt it, would
+  let one stuck action stop the process from exiting. `Stop` cancels and reports
+  instead. Whether the delivery is *still* running is checked when `Stop` asks
+  rather than remembered from the drain, since a whole shutdown phase separates
+  the two and the answer usually changes in between.
+
+- **`Start` refuses to restart a consumer whose previous delivery is still
+  running**, rather than starting a second loop over the top of it and leaving
+  the next `Stop` waiting on the abandoned half of a `WaitGroup`.
+
 ## v0.8.0 (2026-09-01)
 
 ### Changed
