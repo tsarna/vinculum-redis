@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## v0.9.0 (2026-09-06)
+
 ### Added
 
 - **`Drain`, so a consumer can stop reading without stopping.** Stopping used
