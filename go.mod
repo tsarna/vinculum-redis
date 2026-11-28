@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.41.0
-	github.com/redis/go-redis/v9 v9.24.0
+	github.com/redis/go-redis/v9 v9.24.1
 	github.com/stretchr/testify v1.12.1
 	github.com/tsarna/vinculum-bus v0.20.0
 	github.com/tsarna/vinculum-wire v0.5.0
